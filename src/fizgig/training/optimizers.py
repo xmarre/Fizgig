@@ -384,17 +384,23 @@ class RotatingOptimizerStateStore:
         self.last_group_restore_count = restored_groups
         return restored
 
-    def mark_checkpoint(self, checkpoint_path: str, epoch: int) -> None:
+    def mark_checkpoint(self, checkpoint_path: str, epoch: int, state_id: str) -> None:
+        if not state_id:
+            raise ValueError("rotating optimizer checkpoint state_id must be non-empty")
         self._write_manifest({
             "checkpoint": os.path.basename(os.path.abspath(checkpoint_path)),
             "epoch": int(epoch),
+            "state_id": str(state_id),
         })
 
-    def matches_checkpoint(self, checkpoint_path: str, epoch: int) -> bool:
+    def matches_checkpoint(self, checkpoint_path: str, epoch: int, state_id: str) -> bool:
+        if not state_id:
+            return False
         manifest = self._read_manifest()
         return (
             manifest.get("checkpoint") == os.path.basename(os.path.abspath(checkpoint_path))
             and int(manifest.get("epoch", -1)) == int(epoch)
+            and manifest.get("state_id") == str(state_id)
             and self._has_group_state()
         )
 

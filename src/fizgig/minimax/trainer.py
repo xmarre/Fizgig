@@ -2545,17 +2545,19 @@ def train_minimax(
         # silently OVERWRITE the original run's first checkpoint. The --dit file IS the
         # previous checkpoint — offset every checkpoint filename by its trailing epoch
         # number (the FINAL file has no number; its count rides in fizgig_ft_epochs_done).
+        _ft_source_md = {}
+        try:
+            from safetensors import safe_open
+            with safe_open(dit_path, framework="pt") as _f:
+                _ft_source_md = _f.metadata() or {}
+        except Exception:
+            _ft_source_md = {}
         _m = re.search(r"-(\d{6})\.safetensors$", os.path.basename(dit_path or ""))
         if _m:
             ft_epoch_offset = int(_m.group(1))
         else:
-            try:
-                from safetensors import safe_open
-                with safe_open(dit_path, framework="pt") as _f:
-                    _md = _f.metadata() or {}
-                ft_epoch_offset = int(_md.get("fizgig_ft_epochs_done", 0))
-            except Exception:
-                ft_epoch_offset = 0
+            ft_epoch_offset = int(_ft_source_md.get("fizgig_ft_epochs_done", 0) or 0)
+        _ft_resume_state_id = str(_ft_source_md.get("fizgig_prodigy_state_id", "") or "")
         if ft_epoch_offset:
             logger.info("[h3-ft] continuing from %s — checkpoint numbering starts at "
                         "epoch %d", os.path.basename(dit_path), ft_epoch_offset + 1)
@@ -3610,7 +3612,7 @@ def train_minimax(
             _ft_state_root, fresh=(ft_epoch_offset == 0))
         if ft_epoch_offset:
             _ft_optimizer_resume = _ft_optimizer_store.matches_checkpoint(
-                dit_path, ft_epoch_offset)
+                dit_path, ft_epoch_offset, _ft_resume_state_id)
             if _ft_optimizer_resume:
                 logger.info("[h3-ft] Prodigy+ optimizer state matches %s — restoring d, "
                             "moments and per-window Schedule-Free state.",
@@ -3625,6 +3627,9 @@ def train_minimax(
                 _ft_optimizer_store = RotatingOptimizerStateStore(_ft_state_root, fresh=True)
         logger.info("[h3-ft] Prodigy+ rotation state -> %s (inactive optimizer tensors are "
                     "disk-backed so they do not pin VRAM/RAM).", _ft_state_root)
+
+    def _ft_new_optimizer_state_id():
+        return os.urandom(16).hex()
 
     # Per-modality confinement under FT (the routing decided in the rotator block): the
     # active window's Parameters that each modality must NOT touch, rebuilt per window.
@@ -4180,9 +4185,13 @@ def train_minimax(
             "ss_targeted_modules": str(_n_targeted),
             "ss_steps": str(global_step),
             "ss_epochs": str(max_train_epochs),
-            "ss_learning_rate": (
-                "prodigyplus:auto"
-                if (_lora_prodigy or _ft_prodigy) else f"{learning_rate:g}"),
+            # Keep the conventional field numeric for Kohya/metadata consumers. Under
+            # Prodigy+ this is the configured UI value (not the optimizer's adaptive LR);
+            # the dedicated fields below make that distinction machine-readable.
+            "ss_learning_rate": f"{learning_rate:g}",
+            "ss_learning_rate_semantics": (
+                "configured_reference_only;prodigyplus_self_tuning"
+                if (_lora_prodigy or _ft_prodigy) else "optimizer_lr"),
             "ss_optimizer": optimizer_label,
             "ss_prodigy_lr_multiplier": (
                 f"{float((_ft_prodigy_kwargs if _ft_prodigy else parse_optimizer_args(optimizer_args)).get('lr', 1.0)):g}"
@@ -5343,14 +5352,18 @@ def train_minimax(
                 _next_w = rot_schedule.window_at(epoch + 1)
                 if _ft_prodigy and optimizer is not None:
                     _ft_stash_live()
+                _ft_state_id = (_ft_new_optimizer_state_id()
+                                if _ft_optimizer_store is not None else "")
                 try:
                     save_full_checkpoint_h3(rotator, dit_path, ckpt, extra_metadata={
                         **_meta(), "fizgig_next_start_window": str(_next_w),
                         "fizgig_ft_n_windows": str(rot_schedule.n_windows),
-                        "fizgig_ft_epochs_done": str(epoch + 1 + ft_epoch_offset)})
+                        "fizgig_ft_epochs_done": str(epoch + 1 + ft_epoch_offset),
+                        **({"fizgig_prodigy_state_id": _ft_state_id}
+                           if _ft_state_id else {})})
                     if _ft_optimizer_store is not None:
                         _ft_optimizer_store.mark_checkpoint(
-                            ckpt, epoch + 1 + ft_epoch_offset)
+                            ckpt, epoch + 1 + ft_epoch_offset, _ft_state_id)
                 finally:
                     _optimizer_train(optimizer)
                 ft_ckpt_saved_this_epoch = True
@@ -5462,13 +5475,17 @@ def train_minimax(
                     if not ft_ckpt_saved_this_epoch:
                         if _ft_prodigy and optimizer is not None:
                             _ft_stash_live()
+                        _ft_state_id = (_ft_new_optimizer_state_id()
+                                        if _ft_optimizer_store is not None else "")
                         save_full_checkpoint_h3(rotator, dit_path, _pp, extra_metadata={
                             **_meta(), "fizgig_next_start_window": str(_next_w),
                             "fizgig_ft_n_windows": str(rot_schedule.n_windows),
-                            "fizgig_ft_epochs_done": str(epoch + 1 + ft_epoch_offset)})
+                            "fizgig_ft_epochs_done": str(epoch + 1 + ft_epoch_offset),
+                            **({"fizgig_prodigy_state_id": _ft_state_id}
+                               if _ft_state_id else {})})
                         if _ft_optimizer_store is not None:
                             _ft_optimizer_store.mark_checkpoint(
-                                _pp, epoch + 1 + ft_epoch_offset)
+                                _pp, epoch + 1 + ft_epoch_offset, _ft_state_id)
                     logger.info("[h3-ft] paused. Continue with: --dit %s "
                                 "--finetune_start_window %d", os.path.basename(_pp), _next_w)
                     # The checkpoint now carries everything — the scratch is superseded.
@@ -5503,13 +5520,17 @@ def train_minimax(
         _next_w = rot_schedule.window_at(max_train_epochs)
         if _ft_prodigy and optimizer is not None:
             _ft_stash_live()
+        _ft_state_id = (_ft_new_optimizer_state_id()
+                        if _ft_optimizer_store is not None else "")
         save_full_checkpoint_h3(rotator, dit_path, final, extra_metadata={
             **_meta(), "fizgig_next_start_window": str(_next_w),
             "fizgig_ft_n_windows": str(rot_schedule.n_windows),
-            "fizgig_ft_epochs_done": str(max_train_epochs + ft_epoch_offset)})
+            "fizgig_ft_epochs_done": str(max_train_epochs + ft_epoch_offset),
+            **({"fizgig_prodigy_state_id": _ft_state_id}
+               if _ft_state_id else {})})
         if _ft_optimizer_store is not None:
             _ft_optimizer_store.mark_checkpoint(
-                final, max_train_epochs + ft_epoch_offset)
+                final, max_train_epochs + ft_epoch_offset, _ft_state_id)
         logger.info("[h3-ft] saved final fine-tuned checkpoint: %s — test it in ComfyUI as a "
                     "normal H3 model, or distil it to a LoRA with Checkpoint to LoRA. To train "
                     "it further: --dit %s --finetune_start_window %d",

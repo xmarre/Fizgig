@@ -123,9 +123,12 @@ with tempfile.TemporaryDirectory() as td:
 
     store = RotatingOptimizerStateStore(td, fresh=True)
     store.stash([(active_key, p_active), (always_key, p_always)], old)
-    store.mark_checkpoint("run-000003.safetensors", 3)
+    state_id = "state-a"
+    store.mark_checkpoint("run-000003.safetensors", 3, state_id)
     ck("rotation store marks an exact checkpoint",
-       store.matches_checkpoint("run-000003.safetensors", 3))
+       store.matches_checkpoint("run-000003.safetensors", 3, state_id))
+    ck("same filename/epoch with a different state id is not an exact resume",
+       not store.matches_checkpoint("run-000003.safetensors", 3, "state-b"))
 
     p_active_new = nn.Parameter(eval_active.clone())
     p_always_new = nn.Parameter(eval_always.clone())
@@ -179,7 +182,7 @@ with tempfile.TemporaryDirectory() as td:
     exact.eval()
     store.stash([(active_key, p_active_new), (always_key, p_always_new)], exact)
     ck("ordinary rotation invalidates an older checkpoint marker",
-       not store.matches_checkpoint("run-000003.safetensors", 3))
+       not store.matches_checkpoint("run-000003.safetensors", 3, state_id))
 
 # H3's parser and trainer signature expose both adapter and full-finetune Prodigy choices.
 parser = setup_parser()
