@@ -4552,8 +4552,9 @@ class LoRATrainerGUI:
         ToolTip(self._minimax_ft_optimizer_combo,
                 "Adafactor is the existing measured low-VRAM default and supports the fused "
                 "optimizer-in-backward path. Prodigy+ Schedule-Free is optional: it owns the "
-                "learning rate (lr=1 multiplier), disables fused backward and external gradient "
-                "clipping, and uses smaller rotation windows because its optimizer state is "
+                "learning rate (lr=1 multiplier) and disables fused backward. Default "
+                "StableAdamW scaling disables external clipping; expert configs that disable "
+                "internal scaling may use Max Grad Norm. It uses smaller rotation windows because its optimizer state is "
                 "larger. Its d/moments are preserved across window rotations on disk.")
 
         self.minimax_ft_fused_var = tk.BooleanVar(
@@ -4613,8 +4614,9 @@ class LoRATrainerGUI:
                        "the NF4 frozen trunk keeps the default Adafactor path usable down to "
                        "the measured 16 GB streaming tier. Adafactor + fused backward remains "
                        "the validated low-VRAM default at 3e-5. Prodigy+ Schedule-Free is an "
-                       "optional self-tuning path: it disables fused backward and external "
-                       "clipping, uses smaller automatically planned windows, and keeps its "
+                       "optional self-tuning path: it disables fused backward; default internal "
+                       "StableAdamW scaling also disables external clipping. It uses smaller "
+                       "automatically planned windows and keeps its "
                        "optimizer state on disk across rotations; its H3 VRAM/quality behavior "
                        "still needs field calibration. A full ~21 GB checkpoint saves on "
                        "completed rotation cycles and previews follow those saves. Point the "

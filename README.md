@@ -226,7 +226,7 @@ Every control has a hint in the app; the highlights:
 - **Multi Concept** — two subjects, two folders, two trigger words, one LoRA. Each subject's images are only ever compared against their own.
 - **Adapter-relative LR** (default Off) — the LR box becomes a ceiling the run climbs toward, keeping each step proportional to the adapter's size. Worth trying when a run overshoots early.
 - **Caption dropout** (default 0.05) and **Weight averaging (EMA)** (default Off) — leave dropout on; switch EMA on when pushing LR hard.
-- **Optimizer** — full-precision **AdamW remains the validated MiniMax LoRA default**. **Prodigy+ Schedule-Free** is available as an opt-in optimizer. Prodigy+ owns its step size (`lr=1` is its multiplier), so the ordinary Learning Rate value is recorded rather than used as Prodigy's optimizer LR. Fizgig disables external gradient clipping for it and refuses combinations that rewrite or post-correct the optimizer trajectory (Adaptive LR, adapter LR ramp, LR warmup, high-noise LR scaling, anchor-LR retirement, identity-first LR phasing, the movement clip, and EMA while Schedule-Free is active). Extra Prodigy+ options go in **Optimizer Args**, for example `betas=(0.95,0.99) schedulefree_c=8`.
+- **Optimizer** — full-precision **AdamW remains the validated MiniMax LoRA default**. **Prodigy+ Schedule-Free** is available as an opt-in optimizer. Prodigy+ owns its step size (`lr=1` is its multiplier), so the ordinary Learning Rate value is recorded rather than used as Prodigy's optimizer LR. With Prodigy's default StableAdamW update scaling Fizgig disables external gradient clipping; if you explicitly disable that internal scaling, an explicit Max Grad Norm remains available. Fizgig refuses combinations that rewrite or post-correct the optimizer trajectory (Adaptive LR, adapter LR ramp, LR warmup, high-noise LR scaling, anchor-LR retirement, identity-first LR phasing, the movement clip, and EMA while Schedule-Free is active). Extra Prodigy+ options go in **Optimizer Args**, for example `betas=(0.95,0.99) schedulefree_c=8`.
 - **Using the Turbo LoRA in ComfyUI? Skip its custom sampler** — current ComfyUI samples H3 audio cleanly with stock Euler; community consensus is 8 steps, with `minimax_h3_turbo_v4_step600_ema` the strongest checkpoint.
 
 Settings are read at launch; Pause → Resume relaunches with your current settings, so a pause is the moment to change them mid-run.
@@ -402,8 +402,9 @@ the model's full depth from the very first epoch.
 - **Learning rate: 3e-5 with the default Adafactor optimizer** — the tested fast-and-reliable
   H3 fine-tune recipe. A rate as high as 1e-4 destroys this Adafactor fine-tune.
 - **Prodigy+ Schedule-Free is an optional H3 full-finetune optimizer.** Select it inside the
-  full-finetune card. Prodigy+ uses its own adaptive `d` with an LR multiplier of 1, disables
-  optimizer-in-backward and external gradient clipping, and receives a more conservative
+  full-finetune card. Prodigy+ uses its own adaptive `d` with an LR multiplier of 1 and disables
+  optimizer-in-backward. With default StableAdamW scaling it also disables external gradient
+  clipping; explicitly disabling internal scaling leaves Max Grad Norm available. It receives a more conservative
   rotation-window plan for its live gradient/Schedule-Free state. The existing Adafactor path
   remains the default and retains the measured VRAM tiers above. Prodigy+'s extra VRAM model is
   conservative arithmetic from its state layout; it has not yet been field-calibrated on H3.

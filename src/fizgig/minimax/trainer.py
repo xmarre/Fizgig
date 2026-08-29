@@ -2406,12 +2406,15 @@ def train_minimax(
     _lora_prodigy = bool(not ft_rotation and is_prodigy_plus(optimizer_type))
     _lora_schedulefree = bool(
         _lora_prodigy and optimizer_uses_schedulefree(optimizer_type, optimizer_args))
+    _lora_prodigy_kwargs = (parse_optimizer_args(optimizer_args)
+                            if _lora_prodigy else {})
     _ft_prodigy = bool(ft_rotation and is_prodigy_plus(finetune_optimizer_type))
     _ft_prodigy_schedulefree = bool(
         _ft_prodigy and optimizer_uses_schedulefree("prodigyplus", finetune_optimizer_args))
     _ft_prodigy_kwargs = (parse_optimizer_args(finetune_optimizer_args)
                           if _ft_prodigy else {})
     _ft_window_cost_scale = 1.0
+    _ft_fixed_optimizer_gb = 0.0
 
     if not ft_rotation and _lora_prodigy:
         conflicts = []
@@ -2430,16 +2433,25 @@ def train_minimax(
             conflicts.append("identity-first distillation LR phase")
         if block_limit and float(block_limit) > 0:
             conflicts.append("per-step movement clip")
+        if slow_blocks and abs(float(slow_block_lr_scale) - 1.0) > 1e-9:
+            conflicts.append("depth-split LR")
         if _lora_schedulefree and ema_decay and float(ema_decay) > 0:
             conflicts.append("EMA (Schedule-Free already owns the deploy average)")
         if conflicts:
             raise RuntimeError(
                 "[optimizer] Prodigy+ owns its learning-rate/update trajectory and cannot be "
                 "combined with: " + ", ".join(conflicts) + ". Disable those controls for this run.")
-        if max_grad_norm and float(max_grad_norm) > 0:
-            logger.info("[optimizer] Prodigy+ handles update scaling internally — disabling "
-                        "external gradient clipping (max_grad_norm %.3g -> 0).", max_grad_norm)
+        _lora_internal_scaling = (
+            bool(_lora_prodigy_kwargs.get("use_stableadamw", True))
+            and _lora_prodigy_kwargs.get("eps", 1e-8) is not None)
+        if max_grad_norm and float(max_grad_norm) > 0 and _lora_internal_scaling:
+            logger.info("[optimizer] Prodigy+ StableAdamW handles update scaling internally — "
+                        "disabling external gradient clipping (max_grad_norm %.3g -> 0).",
+                        max_grad_norm)
             max_grad_norm = 0.0
+        elif max_grad_norm and float(max_grad_norm) > 0:
+            logger.info("[optimizer] Prodigy+ internal StableAdamW scaling is disabled — "
+                        "honouring external max_grad_norm %.3g.", max_grad_norm)
 
     rotator = None
     ft_subset = None
@@ -2502,19 +2514,30 @@ def train_minimax(
                             "the rotating trainer uses one coherent optimizer step with separate "
                             "persistent d/state cohorts for the live component and refiner.")
             finetune_fused_backward = False
-            if max_grad_norm and float(max_grad_norm) > 0:
-                logger.info("[h3-ft] Prodigy+ handles update scaling internally — disabling "
-                            "external gradient clipping (max_grad_norm %.3g -> 0).", max_grad_norm)
-            max_grad_norm = 0.0
+            _ft_internal_scaling = (
+                bool(_ft_prodigy_kwargs.get("use_stableadamw", True))
+                and _ft_prodigy_kwargs.get("eps", 1e-8) is not None)
+            if max_grad_norm and float(max_grad_norm) > 0 and _ft_internal_scaling:
+                logger.info("[h3-ft] Prodigy+ StableAdamW handles update scaling internally — "
+                            "disabling external gradient clipping (max_grad_norm %.3g -> 0).",
+                            max_grad_norm)
+                max_grad_norm = 0.0
+            elif max_grad_norm and float(max_grad_norm) > 0:
+                logger.info("[h3-ft] Prodigy+ internal StableAdamW scaling is disabled — "
+                            "honouring external max_grad_norm %.3g.", max_grad_norm)
             # Persistent bf16 z/gradient state is roughly 3x the active bf16 weights, and
             # step() materializes fp32 y/z/grad/denom one tensor at a time. 3.5x is the
             # conservative factored-state planner coefficient; full second moments need more.
             _ft_window_cost_scale = (
                 4.5 if (not bool(_ft_prodigy_kwargs.get("factored", True))
                         or bool(_ft_prodigy_kwargs.get("use_focus", False))) else 3.5)
-            logger.info("[h3-ft] Prodigy+ planner: active-window memory cost x%.1f "
-                        "(unfused gradients + adaptive/Schedule-Free state).",
-                        _ft_window_cost_scale)
+            # The calibrated 14.5 GB Adafactor overhead already contains the ~0.4 GB
+            # always-on token refiner. Prodigy adds persistent z + an unfused gradient
+            # there too, so budget only the incremental state beyond the measured 1x.
+            _ft_fixed_optimizer_gb = 0.4 * (_ft_window_cost_scale - 1.0)
+            logger.info("[h3-ft] Prodigy+ planner: active-window memory cost x%.1f + %.1f GB "
+                        "always-on optimizer state (unfused gradients + adaptive/SF state).",
+                        _ft_window_cost_scale, _ft_fixed_optimizer_gb)
         if finetune_blocks:
             parse_block_spec(finetune_blocks)   # early typo check; bounds after the load
         # Continuation numbering (mirrors krea2): a fine-tune continued from a saved
@@ -3127,7 +3150,8 @@ def train_minimax(
         _windows, ft_stream, _plan_why = plan_h3_ft_windows(
             _usable, subset=ft_subset, n_blocks=_n_blocks,
             allow_stream=os.environ.get("FIZGIG_NO_FT_STREAM") != "1",
-            window_cost_scale=_ft_window_cost_scale)
+            window_cost_scale=_ft_window_cost_scale,
+            fixed_overhead_gb=_ft_fixed_optimizer_gb)
         for _line in _plan_why:
             logger.info("[h3-ft] %s", _line)
         if _windows is None:
@@ -4762,7 +4786,7 @@ def train_minimax(
         # they'd freeze the deactivated window's orphans and leave the live one open.
         _ft_rebuild_freeze()
 
-    def _ft_render_previews(n):
+    def _ft_render_previews(n, preserve_optimizer_checkpoint=False):
         """Cycle-boundary preview under rotation FT: deactivate the whole window so the model
         is a consistent all-ConvRot checkpoint (the master holds every trained weight —
         reactivation-exactness is test-pinned), apply the Turbo FRESH against it, run the
@@ -4777,7 +4801,8 @@ def train_minimax(
             if _ft_prodigy:
                 # The preview must see Schedule-Free's deploy/eval representation. Persist
                 # matching z/moments before the Parameter objects disappear.
-                _ft_stash_live(preserve_checkpoint_marker=True)
+                _ft_stash_live(
+                    preserve_checkpoint_marker=bool(preserve_optimizer_checkpoint))
             rotator.deactivate(_act)
             # Drop every optimizer reference to the window's now-orphaned bf16 Parameters —
             # the fused opts dict is KEYED on them, so without this they stay VRAM-resident
@@ -5023,7 +5048,8 @@ def train_minimax(
                 # Incoming live-window requirement. Adafactor's scale is 1.0, preserving the
                 # measured path exactly. Prodigy+ uses the same >1 coefficient as launch-time
                 # planning so state/gradient restoration cannot bypass the admission budget.
-                _need_r = _ft_window_gb(_want) * _ft_window_cost_scale + 2.0
+                _need_r = (_ft_window_gb(_want) * _ft_window_cost_scale
+                           + _ft_fixed_optimizer_gb + 2.0)
                 if _free_r < _need_r and not ft_stream:
                     logger.info("[h3-ft] %.1f GB free before activating the next window "
                                 "(needs ~%.1f) — defragmenting via a full park/restore "
@@ -5383,7 +5409,9 @@ def train_minimax(
                     _optimizer_eval(optimizer)
                 try:
                     if rotator is not None:
-                        _ft_render_previews(epoch + 1)
+                        _ft_render_previews(
+                            epoch + 1,
+                            preserve_optimizer_checkpoint=ft_ckpt_saved_this_epoch)
                     else:
                         _render_previews(epoch + 1)
                     vram_line("post-preview")

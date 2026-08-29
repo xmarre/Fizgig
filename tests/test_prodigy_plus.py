@@ -201,7 +201,8 @@ ck("trainer exposes a separate full-finetune optimizer",
 # Prodigy+ carries materially more live window state than fused Adafactor. The planner must
 # become at least as conservative when the cost multiplier is applied.
 base_windows, _, _ = plan_h3_ft_windows(32.0, n_blocks=50, window_cost_scale=1.0)
-pp_windows, _, _ = plan_h3_ft_windows(32.0, n_blocks=50, window_cost_scale=3.5)
+pp_windows, _, _ = plan_h3_ft_windows(
+    32.0, n_blocks=50, window_cost_scale=3.5, fixed_overhead_gb=1.0)
 ck("Prodigy+ planner never chooses fewer/larger logical windows",
    pp_windows is None or (base_windows is not None and len(pp_windows) >= len(base_windows)),
    (None if base_windows is None else len(base_windows),
