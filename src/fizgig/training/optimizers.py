@@ -73,6 +73,17 @@ def optimizer_uses_schedulefree(name: str, args_str: str = "") -> bool:
     return bool(parse_optimizer_args(args_str).get("use_schedulefree", True))
 
 
+def prodigy_handles_gradient_scaling(args_str: str = "") -> bool:
+    """Whether Prodigy+ already normalizes update scale internally.
+
+    StableAdamW performs RMS update scaling when epsilon is numeric. With eps=None the
+    optimizer switches to Adam-atan2, which is scale-invariant on its own. External gradient
+    clipping is appropriate only when StableAdamW is disabled while retaining numeric epsilon.
+    """
+    kwargs = parse_optimizer_args(args_str)
+    return kwargs.get("eps", 1e-8) is None or bool(kwargs.get("use_stableadamw", True))
+
+
 def available_optimizers(include_self_tuning: bool = False) -> list[str]:
     """Catalog entries whose backing package is importable.
 

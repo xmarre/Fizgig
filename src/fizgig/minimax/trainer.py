@@ -2383,7 +2383,8 @@ def train_minimax(
     from fizgig.networks.lora import create_network
     from fizgig.training.optimizers import (RotatingOptimizerStateStore, create_optimizer,
                                             is_prodigy_plus, optimizer_uses_schedulefree,
-                                            parse_optimizer_args, step_active_optimizer_groups)
+                                            parse_optimizer_args, prodigy_handles_gradient_scaling,
+                                            step_active_optimizer_groups)
     from fizgig.training.train_utils import LossRecorder, validate_output_name
     from fizgig.training.metadata import build_metadata, resolve_title, ARCHITECTURE_MINIMAX
     from fizgig.minimax.loader import load_minimax_h3_dit
@@ -2439,9 +2440,7 @@ def train_minimax(
             raise RuntimeError(
                 "[optimizer] Prodigy+ owns its learning-rate/update trajectory and cannot be "
                 "combined with: " + ", ".join(conflicts) + ". Disable those controls for this run.")
-        _lora_internal_scaling = (
-            bool(_lora_prodigy_kwargs.get("use_stableadamw", True))
-            and _lora_prodigy_kwargs.get("eps", 1e-8) is not None)
+        _lora_internal_scaling = prodigy_handles_gradient_scaling(optimizer_args)
         if max_grad_norm and float(max_grad_norm) > 0 and _lora_internal_scaling:
             logger.info("[optimizer] Prodigy+ StableAdamW handles update scaling internally — "
                         "disabling external gradient clipping (max_grad_norm %.3g -> 0).",
@@ -2513,9 +2512,7 @@ def train_minimax(
                             "the rotating trainer uses one coherent optimizer step with separate "
                             "persistent d/state cohorts for the live component and refiner.")
             finetune_fused_backward = False
-            _ft_internal_scaling = (
-                bool(_ft_prodigy_kwargs.get("use_stableadamw", True))
-                and _ft_prodigy_kwargs.get("eps", 1e-8) is not None)
+            _ft_internal_scaling = prodigy_handles_gradient_scaling(finetune_optimizer_args)
             if max_grad_norm and float(max_grad_norm) > 0 and _ft_internal_scaling:
                 logger.info("[h3-ft] Prodigy+ StableAdamW handles update scaling internally — "
                             "disabling external gradient clipping (max_grad_norm %.3g -> 0).",

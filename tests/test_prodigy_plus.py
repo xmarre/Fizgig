@@ -22,6 +22,7 @@ from fizgig.training.optimizers import (
     available_optimizers,
     create_optimizer,
     optimizer_uses_schedulefree,
+    prodigy_handles_gradient_scaling,
     step_active_optimizer_groups,
 )
 
@@ -42,6 +43,12 @@ ck("MiniMax opt-in catalog contains Prodigy+",
 ck("Prodigy+ defaults to Schedule-Free", optimizer_uses_schedulefree("prodigyplus", ""))
 ck("use_schedulefree=False is respected",
    not optimizer_uses_schedulefree("prodigyplus", "use_schedulefree=False"))
+ck("default StableAdamW owns gradient scaling",
+   prodigy_handles_gradient_scaling(""))
+ck("Adam-atan2 owns gradient scaling when eps=None",
+   prodigy_handles_gradient_scaling("use_stableadamw=False eps=None"))
+ck("external clipping is available only with numeric eps and StableAdamW off",
+   not prodigy_handles_gradient_scaling("use_stableadamw=False eps=1e-8"))
 
 # Fizgig's ordinary LR is NOT forwarded. Prodigy owns d and uses lr=1 as its multiplier.
 p = nn.Parameter(torch.randn(8, 8))
