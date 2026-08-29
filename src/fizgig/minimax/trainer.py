@@ -2597,6 +2597,16 @@ def train_minimax(
         blueprint.dataset_group, training=True, num_timestep_buckets=None, shared_epoch=shared_epoch)
     if group.num_train_items == 0:
         raise RuntimeError("No training items — run minimax_cache_latents then minimax_cache_text first.")
+    if _ft_prodigy:
+        _has_reg = any(getattr(_ds, "is_reg", False) for _ds in group.datasets)
+        if _has_reg and abs(float(reg_lr_multiplier) - 1.0) > 1e-9:
+            raise RuntimeError(
+                "[h3-ft] Prodigy+ cannot provide the regularisation-images LR multiplier "
+                f"x{float(reg_lr_multiplier):g}: its adaptive normalization can cancel a "
+                "constant loss/gradient scale. Set Regularisation LR × to 1.0 for full-strength "
+                "class-balanced examples, or remove the regularisation folder. Reduced-LR "
+                "regularisation remains supported by the default Adafactor path."
+            )
     logger.info(f"MiniMax H3 training: {group.num_train_items} items, {max_train_epochs} epochs")
 
     # FIZGIG_SAVED_TENSOR_AUDIT=1: account every tensor autograd saves for backward, with the
@@ -4927,10 +4937,10 @@ def train_minimax(
         if network is not None:
             network.train()
         if rotator is not None:
-            # Rotate BEFORE the epoch's first step. The optimizer (or the fused per-tensor
-            # set) is rebuilt from scratch each window — the outgoing window's Adafactor
-            # state is meaningless to the incoming one — and `params` is REASSIGNED so
-            # clip_grad_norm_ and the boundary step see the live window, not the old one.
+            # Rotate BEFORE the epoch's first step. Adafactor rebuilds per window; Prodigy+
+            # rebuilds the optimizer object around the fresh Parameters and rebinds persisted
+            # state by stable tensor name. `params` is REASSIGNED so clipping/boundary logic
+            # always sees the live window rather than the previous generation.
             _want = _ft_want(epoch)
             if _want != list(rotator.active):
                 # Decomposed rotate_to (deactivate -> activate is exactly what it does) so a
@@ -5137,14 +5147,11 @@ def train_minimax(
             # so avr_loss and the drift lines see unscaled numbers (Krea 2 FT parity).
             #
             # Honesty note (review, 26 Aug — and the exception to _boundary_step's
-            # "never the loss" doctrine): Adafactor's second-moment normalisation
-            # partially cancels a constant gradient scale, so x0.2 realises as roughly
-            # x0.2-0.25 ONLY while reg steps are the minority feeding each tensor's EMA
-            # (the [reg] majority warning above is that condition). The very first step
-            # after each rotation rebind is fully UNthrottled (fresh state: beta2t=0
-            # makes the update scale-invariant) — ~one stray full-LR reg step per
-            # rotation at typical reg ratios. Krea 2 FT has identical behaviour; the
-            # doctrine comment stays right for everything that CAN ride param-group LR.
+            # "never the loss" doctrine): this reduced-loss approximation is Adafactor-only.
+            # Its second-moment normalisation partially cancels a constant gradient scale, so
+            # x0.2 realises as roughly x0.2-0.25 while reg steps remain the minority feeding
+            # each tensor's EMA. Prodigy+ rejects reduced-LR regularisation up front rather than
+            # pretending this approximation transfers to its adaptive d estimator.
             _bk = loss
             if reg_keys and any(str(k) in reg_keys for k in (batch.get("item_keys") or ())):
                 _bk = loss * reg_mult

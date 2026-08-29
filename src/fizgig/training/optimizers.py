@@ -146,6 +146,13 @@ def create_optimizer(name: str, params, lr: float, args_str: str = "",
     kwargs = parse_optimizer_args(args_str)
     key = _canonical_name(name)
     _warn_lr(key, lr)
+    if key == "prodigyplus" and bool(kwargs.get("fused_back_pass", False)):
+        raise RuntimeError(
+            "[optimizer] Prodigy+ fused_back_pass=True requires trainer-installed "
+            "post-accumulate hooks. Fizgig's MiniMax integration deliberately uses one "
+            "coherent optimizer.step(), so this option is unsupported and must not silently "
+            "turn step() into a no-op."
+        )
 
     # eps 1e-6, not the library defaults' 1e-8 (matches ai-toolkit, which passes eps=1e-6 to
     # every Adam-family optimizer). This is a REAL stability bound, not a nicety: the 8-bit

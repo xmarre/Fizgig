@@ -76,6 +76,14 @@ except RuntimeError as e:
     fail_closed = "Refusing AdamW fallback" in str(e)
 ck("Prodigy+ construction fails closed", fail_closed)
 
+try:
+    create_optimizer("prodigyplus", [nn.Parameter(torch.ones(2, 2))], 1e-4,
+                     "fused_back_pass=True")
+    fused_guard = False
+except RuntimeError as e:
+    fused_guard = "fused_back_pass=True" in str(e)
+ck("Prodigy+ rejects unhooked fused_back_pass instead of making step() a no-op", fused_guard)
+
 # Schedule-Free mode transitions are real and reversible at the API/state level.
 p2 = nn.Parameter(torch.randn(8, 8))
 opt2, _ = create_optimizer("prodigyplus", [p2], 1e-4, "stochastic_rounding=False")

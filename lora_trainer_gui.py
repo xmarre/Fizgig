@@ -4608,22 +4608,17 @@ class LoRATrainerGUI:
 
         self._minimax_ft_hint = ttk.Label(training_content,
                   text="Trains the base model's own weights, not an adapter — Network Type "
-                       "and Blocks to Train hide while this is on (they're LoRA machinery); "
-                       "Optimised Likeness Learning keeps working with its usual meaning. "
-                       "Each window is one matmul (attention qkv/out, MLP fc1/fc2) across "
-                       "every block — full model depth per window, 4 windows per cycle, on "
-                       "an NF4-resident base (the saved checkpoint is still exact int8). "
-                       "The Blocks field above is an optional manual restriction of the "
-                       "whole fine-tune. Needs a 32 GB card and ~64 GB of system RAM. "
-                       "A full ~21 GB checkpoint saves once per COMPLETED CYCLE (every "
-                       "block equally trained — the save box snaps to the cycle "
-                       "automatically), and previews ride along with each save (plus the "
-                       "final one), so every sample matches a checkpoint you can deploy. "
-                       "Photos-only dataset? Leave 'Train on' "
-                       "alone — there's nothing to skip. Use a LOW learning rate (1e-5 to "
-                       "start; H3 is uncalibrated — compare checkpoints). Point the Output "
-                       "Directory somewhere with room, judge results in ComfyUI, and distil "
-                       "to a shareable LoRA with Checkpoint to LoRA.",
+                       "and Blocks to Train hide while this is on; Optimised Likeness Learning "
+                       "keeps its H3 routing role. Component windows span full model depth and "
+                       "the NF4 frozen trunk keeps the default Adafactor path usable down to "
+                       "the measured 16 GB streaming tier. Adafactor + fused backward remains "
+                       "the validated low-VRAM default at 3e-5. Prodigy+ Schedule-Free is an "
+                       "optional self-tuning path: it disables fused backward and external "
+                       "clipping, uses smaller automatically planned windows, and keeps its "
+                       "optimizer state on disk across rotations; its H3 VRAM/quality behavior "
+                       "still needs field calibration. A full ~21 GB checkpoint saves on "
+                       "completed rotation cycles and previews follow those saves. Point the "
+                       "Output Directory somewhere with room and judge checkpoints in ComfyUI.",
                   foreground=COLORS["text_explain"], font=(FONT_FAMILY, 9, "italic"),
                   justify=tk.LEFT, wraplength=720)
         self._minimax_ft_hint.grid(row=71, column=0, columnspan=2, sticky=tk.W, padx=5, pady=(0, 6))
@@ -7480,12 +7475,18 @@ class LoRATrainerGUI:
         return "prodigyplus" if "prodigy" in raw else "adafactor"
 
     def _on_minimax_ft_optimizer_changed(self):
-        """Keep fused-backward state honest for the selected rotation optimizer."""
+        """Keep fused-backward state honest without losing the user's Adafactor choice."""
         if not hasattr(self, "_minimax_ft_fused_cb"):
             return
         prodigy = self._minimax_ft_optimizer_key() == "prodigyplus"
-        if prodigy and self.minimax_ft_fused_var.get():
-            self.minimax_ft_fused_var.set(False)
+        if prodigy:
+            if not hasattr(self, "_minimax_ft_fused_before_prodigy"):
+                self._minimax_ft_fused_before_prodigy = bool(self.minimax_ft_fused_var.get())
+            if self.minimax_ft_fused_var.get():
+                self.minimax_ft_fused_var.set(False)
+        elif hasattr(self, "_minimax_ft_fused_before_prodigy"):
+            self.minimax_ft_fused_var.set(bool(self._minimax_ft_fused_before_prodigy))
+            del self._minimax_ft_fused_before_prodigy
         try:
             self._minimax_ft_fused_cb.configure(
                 state=("disabled" if prodigy else "normal"))
@@ -7611,10 +7612,11 @@ class LoRATrainerGUI:
                                 + "\n  ".join(changed) + "\n")
 
     def _apply_minimax_ft_visibility(self):
-        """FT sub-controls only while the checkbox is on. Everything that is ADAPTER machinery
-        hides under FT rather than sitting there silently ignored — Network Type, Optimised
-        Likeness Learning, and Blocks to Train (the FT card's own Blocks field is the
-        fine-tune's block restriction)."""
+        """Show the H3 fine-tune card while hiding adapter-only controls.
+
+        Network Type and Blocks to Train are adapter machinery. Optimised Likeness Learning
+        stays visible because the full-finetune trainer maps it to the measured H3 routing.
+        """
         if not hasattr(self, "_minimax_ft_frame"):
             return
         on = bool(self.minimax_finetune_var.get())
@@ -7628,6 +7630,7 @@ class LoRATrainerGUI:
                   self._minimax_ft_fused_cb, self._minimax_reg_frame,
                   self._minimax_ft_hint):
             self._set_widget_visible(w, on)
+        self._on_minimax_ft_optimizer_changed()
         # The likeness tickbox STAYS — same meaning, different mechanism: under FT it drives
         # the Blocks field (whole fine-tune on the identity blocks) instead of masking photo
         # steps. Its hint swaps to say so. Blocks to Train is adapter-only and hides.
@@ -7818,8 +7821,8 @@ class LoRATrainerGUI:
         # the selector. A name valid for one may not exist in the other (Klein takes module paths;
         # krea2 takes catalog names), so fall back to the shared default rather than carrying a
         # value across that the trainer would then have to reject.
-        # MiniMax resolves optimizer names the same catalog-based way Krea 2 does (its trainer
-        # takes catalog names too), so it shares Krea 2's dropdown contents.
+        # MiniMax also resolves catalog names, with the explicitly integrated self-tuning
+        # Prodigy+ entry added only for that family.
         self._refresh_optimizer_choices(is_krea2, is_minimax)
 
         # Krea 2-ONLY controls (inverse of the above): the per-image loss watch toggles are only
@@ -7843,8 +7846,9 @@ class LoRATrainerGUI:
         if is_minimax:
             self._apply_minimax_ft_visibility()
         elif hasattr(self, "_minimax_ft_frame"):
-            for w in (self._minimax_ft_frame, self._minimax_ft_fused_cb,
-                      self._minimax_reg_frame, self._minimax_ft_hint):
+            for w in (self._minimax_ft_frame, self._minimax_ft_optimizer_frame,
+                      self._minimax_ft_fused_cb, self._minimax_reg_frame,
+                      self._minimax_ft_hint):
                 self._set_widget_visible(w, False)
         # Network Type (LoRA/LoKR) is wired for BOTH native families (krea2_train and
         # minimax_train take --network_type/--lokr_factor); Klein trains standard only.
