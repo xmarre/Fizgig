@@ -409,13 +409,16 @@ the model's full depth from the very first epoch.
   conservative arithmetic from its state layout; it has not yet been field-calibrated on H3.
 - **Prodigy+ rotation state is disk-backed.** Fizgig writes a hidden
   `.<output-name>.prodigyplus-ft-state` directory beside the output checkpoints. It carries
-  global `d`, per-weight moments and Schedule-Free `z` across fresh Parameter objects at every
-  rotation. The latest matching checkpoint can resume that optimizer state after Pause/Resume.
+  per-component adaptive `d`/step state, a separate always-on refiner cohort, per-weight
+  moments and Schedule-Free `z` across fresh Parameter objects at every rotation. A component
+  never inherits another component's learned stepsize. The latest matching checkpoint can resume
+  that optimizer state after Pause/Resume.
   The directory can become large because it eventually contains optimizer state for every
   trained window; keep it when continuing the run and delete it when optimizer resume is no
   longer needed. Reduced-LR regularisation images are currently Adafactor-only; with Prodigy+
   either leave the regularisation folder empty or set **LR × = 1.0** for full-strength
-  class-balanced examples.
+  class-balanced examples. Full-finetune `split_groups=False` and
+  `split_groups_mean=True` are rejected because both collapse the independent rotation cohorts.
 - **Use unique trigger tokens** — strongly recommended: an invented token gives the fine-tune
   somewhere clean to bind, where a common word drags its existing meaning along with it.
 - **Run length: there's no standard number.** It depends on learning rate, dataset size and

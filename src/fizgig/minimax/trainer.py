@@ -2486,11 +2486,21 @@ def train_minimax(
                 raise RuntimeError(
                     "[h3-ft] Prodigy+ fused_back_pass is not supported by the rotation trainer: "
                     "per-modality requires_grad routing means not every hook fires on every step, "
-                    "which would leave Prodigy's global step accounting incomplete.")
+                    "which would leave Prodigy's step accounting incomplete.")
+            if not bool(_ft_prodigy_kwargs.get("split_groups", True)):
+                raise RuntimeError(
+                    "[h3-ft] Prodigy+ split_groups=False is incompatible with rotation: the "
+                    "active component and always-on refiner need independent persistent d/state "
+                    "cohorts so a component-specific stepsize is not inherited by another window.")
+            if bool(_ft_prodigy_kwargs.get("split_groups_mean", False)):
+                raise RuntimeError(
+                    "[h3-ft] Prodigy+ split_groups_mean=True is incompatible with rotation: "
+                    "the active component group changes at each window boundary, so a shared "
+                    "harmonic-mean d would be stale on the first step after every rotation.")
             if finetune_fused_backward:
                 logger.info("[h3-ft] Prodigy+ selected — disabling optimizer-in-backward; "
-                            "the rotating trainer uses one coherent optimizer step so Prodigy's "
-                            "global d estimate sees the complete active window.")
+                            "the rotating trainer uses one coherent optimizer step with separate "
+                            "persistent d/state cohorts for the live component and refiner.")
             finetune_fused_backward = False
             if max_grad_norm and float(max_grad_norm) > 0:
                 logger.info("[h3-ft] Prodigy+ handles update scaling internally — disabling "
@@ -3541,26 +3551,30 @@ def train_minimax(
                            f"({type(_ae).__name__}: {_ae}) — samples render silent")
         return _audio_dec_state["dec"]
 
-    def _ft_named_trainable_params():
-        """Stable logical names for the current rotation window, in trainable_params order."""
+    def _ft_named_trainable_groups():
+        """Stable logical names split into the rotating component and always-on cohort."""
         if rotator is None:
-            return []
-        out, seen = [], set()
+            return [], []
+        active, always, seen = [], [], set()
         for key, lin in rotator._targets(list(rotator.active)):
             for suffix, param in (("weight", lin.weight), ("bias", lin.bias)):
                 if param is None or not param.requires_grad or id(param) in seen:
                     continue
                 name = key if suffix == "weight" else key[:-len(".weight")] + ".bias"
-                out.append((name, param))
+                active.append((name, param))
                 seen.add(id(param))
         for prefix, module in rotator.always:
             for name, param in module.named_parameters():
                 if param.requires_grad and id(param) not in seen:
-                    out.append((f"{prefix}.{name}", param))
+                    always.append((f"{prefix}.{name}", param))
                     seen.add(id(param))
-        return out
+        return active, always
 
-    _ft_named_params = _ft_named_trainable_params()
+    def _ft_refresh_named_params():
+        active, always = _ft_named_trainable_groups()
+        return active, always, active + always
+
+    _ft_named_active, _ft_named_always, _ft_named_params = _ft_refresh_named_params()
     params = ([p for _, p in _ft_named_params] if rotator is not None
               else list(network.get_trainable_params()))
 
@@ -3716,14 +3730,34 @@ def train_minimax(
                         len(_audio_mask_params), len(params))
 
     # Rotation FT defaults to Adafactor because its factored state plus optimizer-in-backward
-    # is the measured low-VRAM recipe. Prodigy+ is an explicit alternative: one coherent,
-    # non-fused optimizer is required so its global d estimate observes the whole live window.
+    # is the measured low-VRAM recipe. Prodigy+ is an explicit alternative: its rotating
+    # component and always-on refiner are distinct adaptive groups whose state persists by
+    # logical identity while the Parameter objects are rebuilt.
     _fused = {"on": False, "opts": {}, "handles": []}
+
+    def _ft_prodigy_param_groups():
+        groups = []
+        if _ft_named_active:
+            groups.append({
+                "params": [p for _, p in _ft_named_active],
+                "lr_scale": 1.0,
+                "fizgig_state_key": "window:" + repr(tuple(rotator.active)),
+            })
+        if _ft_named_always:
+            groups.append({
+                "params": [p for _, p in _ft_named_always],
+                "lr_scale": 1.0,
+                "fizgig_state_key": "always",
+            })
+        if not groups:
+            raise RuntimeError("[h3-ft] Prodigy+ found no trainable parameters in this window")
+        return groups
 
     def _make_ft_optimizer(_params):
         if _ft_prodigy:
             opt, label = create_optimizer(
-                "prodigyplus", _params, learning_rate, finetune_optimizer_args)
+                "prodigyplus", _ft_prodigy_param_groups(),
+                learning_rate, finetune_optimizer_args)
             return opt, f"{label} (rotation)"
         try:
             from transformers.optimization import Adafactor
@@ -3803,8 +3837,10 @@ def train_minimax(
             optimizer, optimizer_label = _make_ft_optimizer(params)
             _restored = _ft_bind_saved_state()
             if _ft_optimizer_resume:
-                logger.info("[h3-ft] Prodigy+ rebound %d parameter state record(s) into "
-                            "the continuation window.", _restored)
+                logger.info("[h3-ft] Prodigy+ rebound %d parameter state record(s), %d/%d "
+                            "adaptive group state record(s) into the continuation window.",
+                            _restored, _ft_optimizer_store.last_group_restore_count,
+                            len(optimizer.param_groups))
         if _ft_prodigy:
             logger.info("optimizer: %s (Prodigy+ lr multiplier %.4g; Learning Rate box %.3e "
                         "is not the optimizer LR)", optimizer_label,
@@ -4708,8 +4744,8 @@ def train_minimax(
         3+ GB of zombie weights alive while the new params accumulate un-stepped, un-freed
         gradients (field bug: 29.5 GB peak on a 24 GB window, and the window silently not
         training after an epoch-0 preview)."""
-        nonlocal params, optimizer, _ft_named_params
-        _ft_named_params = _ft_named_trainable_params()
+        nonlocal params, optimizer, _ft_named_active, _ft_named_always, _ft_named_params
+        _ft_named_active, _ft_named_always, _ft_named_params = _ft_refresh_named_params()
         params = [p for _, p in _ft_named_params]
         if finetune_fused_backward:
             _attach_fused(params)
@@ -4717,8 +4753,11 @@ def train_minimax(
             optimizer, _ = _make_ft_optimizer(params)
             _restored = _ft_bind_saved_state()
             if _ft_prodigy:
-                logger.info("[h3-ft] Prodigy+ rebound %d/%d parameter state record(s) for "
-                            "the live window.", _restored, len(_ft_named_params))
+                logger.info("[h3-ft] Prodigy+ rebound %d/%d parameter state record(s), "
+                            "%d/%d adaptive group state record(s) for the live window.",
+                            _restored, len(_ft_named_params),
+                            _ft_optimizer_store.last_group_restore_count,
+                            len(optimizer.param_groups))
         # Fresh Parameter objects -> the modality freeze lists must be rebuilt too, or
         # they'd freeze the deactivated window's orphans and leave the live one open.
         _ft_rebuild_freeze()
@@ -4956,8 +4995,8 @@ def train_minimax(
                 if _act_now:
                     if _ft_prodigy:
                         # Store eval/master weights plus optimizer state before rotation. This
-                        # keeps every inactive master tensor checkpoint-ready and carries global
-                        # d + per-weight state into the next fresh Parameter objects.
+                        # keeps every inactive master tensor checkpoint-ready and carries the
+                        # component/refiner adaptive groups + per-weight state forward.
                         _ft_stash_live()
                     # Release the optimizer's grip BEFORE deactivating — the fused opts are
                     # KEYED on the outgoing window's Parameters, and _ft_rebind_optimizer
@@ -4981,10 +5020,10 @@ def train_minimax(
                     _free_r = _pfv()
                 except Exception:
                     _free_r = 99.0
-                # Component window: projected bf16 size of the incoming spec — depth-split
-                # entries count only their slice, so a 17-block fc1 chunk no longer reads
-                # as the full-depth 15.4 GB.
-                _need_r = _ft_window_gb(_want) + 2.0
+                # Incoming live-window requirement. Adafactor's scale is 1.0, preserving the
+                # measured path exactly. Prodigy+ uses the same >1 coefficient as launch-time
+                # planning so state/gradient restoration cannot bypass the admission budget.
+                _need_r = _ft_window_gb(_want) * _ft_window_cost_scale + 2.0
                 if _free_r < _need_r and not ft_stream:
                     logger.info("[h3-ft] %.1f GB free before activating the next window "
                                 "(needs ~%.1f) — defragmenting via a full park/restore "

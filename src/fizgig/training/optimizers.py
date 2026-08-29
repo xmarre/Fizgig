@@ -237,16 +237,16 @@ def create_optimizer(name: str, params, lr: float, args_str: str = "",
 class RotatingOptimizerStateStore:
     """Disk-backed optimizer state for rotating Parameters with stable logical names.
 
-    Rotation replaces Parameter objects, so an optimizer cannot retain state by object identity.
-    The store keeps per-parameter state on disk by model key and the small shared param-group
-    adaptation state separately. This preserves Prodigy's d/moments/Schedule-Free z across
-    rotations without keeping inactive optimizer tensors in GPU or system RAM.
+    Parameter state is keyed by model tensor name. Param-group state is keyed separately by a
+    trainer-supplied fizgig_state_key so Prodigy's adaptive d/step/Schedule-Free bookkeeping
+    follows logical rotation cohorts instead of leaking from one component window into another.
+    Inactive state lives on disk rather than pinning GPU or system RAM.
     """
 
     def __init__(self, root: str, *, fresh: bool = False):
         self.root = os.path.abspath(root)
-        self._group_path = os.path.join(self.root, "group.pt")
         self._manifest_path = os.path.join(self.root, "manifest.json")
+        self.last_group_restore_count = 0
         if fresh:
             shutil.rmtree(self.root, ignore_errors=True)
         os.makedirs(self.root, exist_ok=True)
@@ -256,7 +256,15 @@ class RotatingOptimizerStateStore:
         return hashlib.sha1(name.encode("utf-8")).hexdigest()[:20]
 
     def _state_path(self, name: str) -> str:
-        return os.path.join(self.root, self._token(name) + ".pt")
+        return os.path.join(self.root, "param-" + self._token(name) + ".pt")
+
+    def _group_path(self, key: str) -> str:
+        return os.path.join(self.root, "group-" + self._token(key) + ".pt")
+
+    @staticmethod
+    def _group_key(group, index: int) -> str:
+        key = group.get("fizgig_state_key")
+        return str(key) if key is not None else f"group:{index}"
 
     @classmethod
     def _cpu_copy(cls, value):
@@ -295,23 +303,33 @@ class RotatingOptimizerStateStore:
         except (OSError, ValueError, TypeError):
             return {}
 
+    def _has_group_state(self) -> bool:
+        try:
+            return any(name.startswith("group-") and name.endswith(".pt")
+                       for name in os.listdir(self.root))
+        except OSError:
+            return False
+
     def stash(self, named_params, optimizer, *, preserve_checkpoint_marker: bool = False) -> None:
-        """Persist the live optimizer using stable model keys.
+        """Persist live optimizer state by logical parameter and group identity."""
+        if optimizer is None:
+            raise RuntimeError("rotating optimizer state requires a live optimizer")
 
-        The trainer calls this while the Parameters still exist. Schedule-Free callers should
-        enter optimizer.eval() first, so the master weight and the saved train_mode agree.
-        """
-        if optimizer is None or len(optimizer.param_groups) != 1:
-            raise RuntimeError("rotating optimizer state requires exactly one optimizer param group")
-
-        group_state = {
-            k: self._cpu_copy(v)
-            for k, v in optimizer.param_groups[0].items()
-            if k != "params"
-        }
-        tmp = self._group_path + ".tmp"
-        torch.save(group_state, tmp)
-        os.replace(tmp, self._group_path)
+        group_keys = set()
+        for index, group in enumerate(optimizer.param_groups):
+            key = self._group_key(group, index)
+            if key in group_keys:
+                raise RuntimeError(f"duplicate rotating optimizer group key: {key!r}")
+            group_keys.add(key)
+            group_state = {
+                k: self._cpu_copy(v)
+                for k, v in group.items()
+                if k not in ("params", "fizgig_state_key")
+            }
+            path = self._group_path(key)
+            tmp = path + ".tmp"
+            torch.save(group_state, tmp)
+            os.replace(tmp, path)
 
         for name, param in named_params:
             state = optimizer.state.get(param)
@@ -327,18 +345,27 @@ class RotatingOptimizerStateStore:
 
     def bind(self, named_params, optimizer) -> int:
         """Bind persisted logical state to freshly-created Parameter objects."""
-        if optimizer is None or len(optimizer.param_groups) != 1:
-            raise RuntimeError("rotating optimizer state requires exactly one optimizer param group")
+        if optimizer is None:
+            raise RuntimeError("rotating optimizer state requires a live optimizer")
 
-        group = optimizer.param_groups[0]
-        if os.path.isfile(self._group_path):
+        restored_groups = 0
+        seen_group_keys = set()
+        for index, group in enumerate(optimizer.param_groups):
+            key = self._group_key(group, index)
+            if key in seen_group_keys:
+                raise RuntimeError(f"duplicate rotating optimizer group key: {key!r}")
+            seen_group_keys.add(key)
+            path = self._group_path(key)
+            if not os.path.isfile(path):
+                continue
             try:
-                saved_group = torch.load(self._group_path, map_location="cpu", weights_only=True)
+                saved_group = torch.load(path, map_location="cpu", weights_only=True)
             except TypeError:
-                saved_group = torch.load(self._group_path, map_location="cpu")
-            device = named_params[0][1].device if named_params else "cpu"
-            for key, value in saved_group.items():
-                group[key] = self._device_copy(value, device)
+                saved_group = torch.load(path, map_location="cpu")
+            device = group["params"][0].device if group.get("params") else "cpu"
+            for field, value in saved_group.items():
+                group[field] = self._device_copy(value, device)
+            restored_groups += 1
 
         restored = 0
         for name, param in named_params:
@@ -352,10 +379,9 @@ class RotatingOptimizerStateStore:
             optimizer.state[param] = self._device_copy(state, param.device)
             restored += 1
 
-        # Prodigy uses this transient counter to know when a logical optimizer step ends.
-        # A fresh optimizer object must never inherit a half-finished count from an old window.
         if hasattr(optimizer, "parameters_to_process"):
             optimizer.parameters_to_process = None
+        self.last_group_restore_count = restored_groups
         return restored
 
     def mark_checkpoint(self, checkpoint_path: str, epoch: int) -> None:
@@ -369,7 +395,7 @@ class RotatingOptimizerStateStore:
         return (
             manifest.get("checkpoint") == os.path.basename(os.path.abspath(checkpoint_path))
             and int(manifest.get("epoch", -1)) == int(epoch)
-            and os.path.isfile(self._group_path)
+            and self._has_group_state()
         )
 
     def cleanup(self) -> None:
