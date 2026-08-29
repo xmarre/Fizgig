@@ -132,6 +132,16 @@ installer before download.
 
 ---
 
+## Prodigy + Schedule-Free — Apache License 2.0
+
+Upstream: https://github.com/LoganBooker/prodigy-plus-schedule-free
+
+Fizgig optionally uses the `prodigy-plus-schedule-free` Python package for MiniMax H3
+LoRA/LoKR and rotation full-finetune optimizer support. The dependency is distributed under
+the Apache License, Version 2.0.
+
+---
+
 ## Note on model weights
 
 The third-party notices above cover **source code** only. Krea 2 / FLUX.2 model

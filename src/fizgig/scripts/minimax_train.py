@@ -52,7 +52,9 @@ def setup_parser() -> argparse.ArgumentParser:
                         "full-matrix w2 — dim/alpha unused, --lokr_factor is the dial)")
     p.add_argument("--lokr_factor", type=int, default=8,
                    help="LoKR only: Kronecker split factor (w1 is ~factor x factor)")
-    p.add_argument("--learning_rate", type=float, default=1e-4)
+    p.add_argument("--learning_rate", type=float, default=1e-4,
+                   help="Adam-family LR. Prodigy+ owns its step size and uses lr=1 as a "
+                        "multiplier unless optimizer_args overrides lr explicitly.")
     p.add_argument("--max_train_epochs", type=int, default=10)
     p.add_argument("--save_every_n_epochs", type=int, default=0)
     p.add_argument("--save_state", action="store_true",
@@ -67,7 +69,8 @@ def setup_parser() -> argparse.ArgumentParser:
                         "adaptive-LR state restored).")
     p.add_argument("--max_grad_norm", type=float, default=1.0)
     p.add_argument("--seed", type=int, default=42)
-    p.add_argument("--optimizer_type", default="adamw8bit", choices=available_optimizers())
+    p.add_argument("--optimizer_type", default="adamw8bit",
+                   choices=available_optimizers(include_self_tuning=True))
     p.add_argument("--optimizer_args", default="", help='Free-form kwargs, e.g. "weight_decay=0.01"')
     p.add_argument("--caption_dropout", type=float, default=0.05,
                    help="Fraction of steps trained on the empty prompt (reference default 0.05; "
@@ -255,6 +258,13 @@ def setup_parser() -> argparse.ArgumentParser:
                         "checkpoint is still exact int8.")
     p.add_argument("--finetune_start_window", type=int, default=0,
                    help="Continue a fine-tune mid-cycle (printed at every save)")
+    p.add_argument("--finetune_optimizer_type", default="adafactor",
+                   choices=["adafactor", "prodigyplus"],
+                   help="Rotation full-finetune optimizer. Adafactor preserves the low-VRAM "
+                        "default; Prodigy+ Schedule-Free is opt-in and uses non-fused backward.")
+    p.add_argument("--finetune_optimizer_args", default="",
+                   help="Extra kwargs for Prodigy+, e.g. "
+                        "'betas=(0.95,0.99) schedulefree_c=8'.")
     p.add_argument("--finetune_fused_backward", action="store_true", default=True,
                    help="Free each gradient as it lands (per-tensor optimizers; "
                         "disables grad clipping and accumulation)")
@@ -373,6 +383,8 @@ def main():
         finetune_rotate_every=args.finetune_rotate_every,
         finetune_rotation_mode=args.finetune_rotation_mode,
         finetune_start_window=args.finetune_start_window,
+        finetune_optimizer_type=args.finetune_optimizer_type,
+        finetune_optimizer_args=args.finetune_optimizer_args,
         finetune_fused_backward=args.finetune_fused_backward,
         finetune_scope=args.finetune_scope,
         finetune_blocks=args.finetune_blocks,
