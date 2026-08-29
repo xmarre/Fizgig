@@ -234,6 +234,32 @@ def create_optimizer(name: str, params, lr: float, args_str: str = "",
     return opt, label
 
 
+def step_active_optimizer_groups(optimizer) -> bool:
+    """Step only param groups that contain at least one gradient.
+
+    Prodigy+ with split_groups=True advances group-level k/d/Schedule-Free statistics for every
+    group present in optimizer.param_groups, even when every tensor in one group has grad=None.
+    H3 rotation routing can intentionally produce exactly that shape: a component window may be
+    fully frozen for one modality while the always-on refiner still trains. Temporarily excluding
+    empty groups keeps no-op cohort optimizer clocks stationary, then restores the original
+    group list before zero_grad/state/save code can observe it.
+    """
+    groups = optimizer.param_groups
+    active = [group for group in groups
+              if any(param.grad is not None for param in group.get("params", ()))]
+    if not active:
+        return False
+    if len(active) == len(groups):
+        optimizer.step()
+        return True
+    optimizer.param_groups = active
+    try:
+        optimizer.step()
+    finally:
+        optimizer.param_groups = groups
+    return True
+
+
 class RotatingOptimizerStateStore:
     """Disk-backed optimizer state for rotating Parameters with stable logical names.
 

@@ -2383,7 +2383,7 @@ def train_minimax(
     from fizgig.networks.lora import create_network
     from fizgig.training.optimizers import (RotatingOptimizerStateStore, create_optimizer,
                                             is_prodigy_plus, optimizer_uses_schedulefree,
-                                            parse_optimizer_args)
+                                            parse_optimizer_args, step_active_optimizer_groups)
     from fizgig.training.train_utils import LossRecorder, validate_output_name
     from fizgig.training.metadata import build_metadata, resolve_title, ARCHITECTURE_MINIMAX
     from fizgig.minimax.loader import load_minimax_h3_dit
@@ -2433,8 +2433,6 @@ def train_minimax(
             conflicts.append("identity-first distillation LR phase")
         if block_limit and float(block_limit) > 0:
             conflicts.append("per-step movement clip")
-        if slow_blocks and abs(float(slow_block_lr_scale) - 1.0) > 1e-9:
-            conflicts.append("depth-split LR")
         if _lora_schedulefree and ema_decay and float(ema_decay) > 0:
             conflicts.append("EMA (Schedule-Free already owns the deploy average)")
         if conflicts:
@@ -4996,7 +4994,13 @@ def train_minimax(
         if limiter is not None:
             limiter.pre_step()           # snapshot BEFORE the optimizer moves anything
         if optimizer is not None:        # None under FT's fused backward (per-tensor hooks)
-            optimizer.step()
+            if _ft_prodigy and rotator is not None:
+                # Split Prodigy cohorts have independent clocks. A routed modality can freeze
+                # the entire rotating component group while the always-on refiner still has
+                # gradients; do not advance d/k/Schedule-Free state for that no-op cohort.
+                step_active_optimizer_groups(optimizer)
+            else:
+                optimizer.step()
             optimizer.zero_grad(set_to_none=True)
         if limiter is not None:
             limiter.step()

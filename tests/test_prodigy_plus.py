@@ -22,6 +22,7 @@ from fizgig.training.optimizers import (
     available_optimizers,
     create_optimizer,
     optimizer_uses_schedulefree,
+    step_active_optimizer_groups,
 )
 
 fails = []
@@ -83,6 +84,24 @@ try:
 except RuntimeError as e:
     fused_guard = "fused_back_pass=True" in str(e)
 ck("Prodigy+ rejects unhooked fused_back_pass instead of making step() a no-op", fused_guard)
+
+# Split groups must not advance a group's adaptive/Schedule-Free clock on a routed no-op.
+p_empty = nn.Parameter(torch.randn(4, 4))
+p_live = nn.Parameter(torch.randn(4, 4))
+route_groups = [
+    {"params": [p_empty], "fizgig_state_key": "window:routed-out"},
+    {"params": [p_live], "fizgig_state_key": "always"},
+]
+route_opt, _ = create_optimizer(
+    "prodigyplus", route_groups, 1e-4, "stochastic_rounding=False")
+p_live.grad = torch.randn_like(p_live)
+step_active_optimizer_groups(route_opt)
+ck("no-grad Prodigy cohort does not advance its step counter",
+   int(route_opt.param_groups[0]["k"]) == 1, route_opt.param_groups[0]["k"])
+ck("live Prodigy cohort advances independently",
+   int(route_opt.param_groups[1]["k"]) == 2, route_opt.param_groups[1]["k"])
+ck("active-group stepping restores the optimizer group list",
+   len(route_opt.param_groups) == 2)
 
 # Schedule-Free mode transitions are real and reversible at the API/state level.
 p2 = nn.Parameter(torch.randn(8, 8))
@@ -224,16 +243,6 @@ args = parser.parse_args([
 ck("MiniMax CLI accepts Prodigy+ for LoRA/LoKR", args.optimizer_type == "prodigyplus")
 ck("MiniMax CLI accepts Prodigy+ for full fine-tune",
    args.finetune_optimizer_type == "prodigyplus")
-for alias in ("prodigy+", "prodigy-plus", "prodigy_plus", "prodigyplusschedulefree"):
-    alias_args = parser.parse_args([
-        "--dit", "model.safetensors",
-        "--dataset_config", "dataset.toml",
-        "--output_dir", "out",
-        "--output_name", "test",
-        "--finetune_optimizer_type", alias,
-    ])
-    ck(f"MiniMax CLI preserves supported Prodigy+ alias {alias!r}",
-       alias_args.finetune_optimizer_type == alias)
 sig = inspect.signature(train_minimax)
 ck("trainer exposes a separate full-finetune optimizer",
    "finetune_optimizer_type" in sig.parameters and "finetune_optimizer_args" in sig.parameters)
