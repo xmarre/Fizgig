@@ -2488,7 +2488,8 @@ def train_minimax(
         if finetune_scope not in ("all", "photo"):
             raise RuntimeError(f"[h3-ft] finetune_scope must be 'all' or 'photo', "
                                f"got {finetune_scope!r}")
-        _ft_opt_key = str(finetune_optimizer_type or "adafactor").strip().lower()
+        _ft_opt_key = ("prodigyplus" if _ft_prodigy
+                       else str(finetune_optimizer_type or "adafactor").strip().lower())
         if _ft_opt_key not in ("adafactor", "prodigyplus"):
             raise RuntimeError(
                 f"[h3-ft] unsupported fine-tune optimizer {finetune_optimizer_type!r}; "

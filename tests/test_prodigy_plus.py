@@ -177,7 +177,34 @@ with tempfile.TemporaryDirectory() as td:
        restored_other == 1 and store.last_group_restore_count == 1,
        (restored_other, store.last_group_restore_count))
 
-    # A normal rotation changes optimizer state and invalidates the old checkpoint marker.
+    # A preview immediately after the checkpoint has not trained another step. Re-stashing
+    # the same eval state must preserve the exact-resume marker.
+    store.stash(
+        [(active_key, p_active_new), (always_key, p_always_new)], exact,
+        preserve_checkpoint_marker=True)
+    ck("preview stash preserves the checkpoint marker",
+       store.matches_checkpoint("run-000003.safetensors", 3, state_id))
+
+    # A failed state mutation must invalidate the old marker BEFORE any sidecar file can
+    # change. Simulate an interrupted torch.save and verify resume fails closed.
+    _torch_save = torch.save
+    try:
+        def _fail_save(*_args, **_kwargs):
+            raise RuntimeError("simulated interrupted sidecar write")
+        torch.save = _fail_save
+        try:
+            store.stash([(active_key, p_active_new), (always_key, p_always_new)], exact)
+            interrupted_failed_closed = False
+        except RuntimeError as e:
+            interrupted_failed_closed = "simulated interrupted sidecar write" in str(e)
+    finally:
+        torch.save = _torch_save
+    ck("interrupted sidecar mutation fails closed", interrupted_failed_closed)
+    ck("interrupted mutation invalidates the prior checkpoint marker",
+       not store.matches_checkpoint("run-000003.safetensors", 3, state_id))
+
+    # A normal rotation changes optimizer state and invalidates the old checkpoint marker too.
+    store.mark_checkpoint("run-000003.safetensors", 3, state_id)
     exact.train()
     exact.eval()
     store.stash([(active_key, p_active_new), (always_key, p_always_new)], exact)
@@ -197,6 +224,16 @@ args = parser.parse_args([
 ck("MiniMax CLI accepts Prodigy+ for LoRA/LoKR", args.optimizer_type == "prodigyplus")
 ck("MiniMax CLI accepts Prodigy+ for full fine-tune",
    args.finetune_optimizer_type == "prodigyplus")
+for alias in ("prodigy+", "prodigy-plus", "prodigy_plus", "prodigyplusschedulefree"):
+    alias_args = parser.parse_args([
+        "--dit", "model.safetensors",
+        "--dataset_config", "dataset.toml",
+        "--output_dir", "out",
+        "--output_name", "test",
+        "--finetune_optimizer_type", alias,
+    ])
+    ck(f"MiniMax CLI preserves supported Prodigy+ alias {alias!r}",
+       alias_args.finetune_optimizer_type == alias)
 sig = inspect.signature(train_minimax)
 ck("trainer exposes a separate full-finetune optimizer",
    "finetune_optimizer_type" in sig.parameters and "finetune_optimizer_args" in sig.parameters)

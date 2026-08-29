@@ -315,12 +315,21 @@ class RotatingOptimizerStateStore:
         if optimizer is None:
             raise RuntimeError("rotating optimizer state requires a live optimizer")
 
+        # Validate the whole group layout before touching persistent state. Once mutation
+        # begins, invalidate any checkpoint marker FIRST: a crash halfway through atomic
+        # per-file replacements may leave a mixed sidecar, which must never still advertise
+        # itself as an exact match for the previous checkpoint.
         group_keys = set()
         for index, group in enumerate(optimizer.param_groups):
             key = self._group_key(group, index)
             if key in group_keys:
                 raise RuntimeError(f"duplicate rotating optimizer group key: {key!r}")
             group_keys.add(key)
+        if not preserve_checkpoint_marker:
+            self._write_manifest({})
+
+        for index, group in enumerate(optimizer.param_groups):
+            key = self._group_key(group, index)
             group_state = {
                 k: self._cpu_copy(v)
                 for k, v in group.items()
@@ -339,9 +348,6 @@ class RotatingOptimizerStateStore:
             tmp = path + ".tmp"
             torch.save(self._cpu_copy(state), tmp)
             os.replace(tmp, path)
-
-        if not preserve_checkpoint_marker:
-            self._write_manifest({})
 
     def bind(self, named_params, optimizer) -> int:
         """Bind persisted logical state to freshly-created Parameter objects."""
