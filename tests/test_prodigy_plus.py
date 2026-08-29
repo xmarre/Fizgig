@@ -132,6 +132,8 @@ with tempfile.TemporaryDirectory() as td:
         p_always.grad = torch.randn_like(p_always)
         old.step()
         old.zero_grad(set_to_none=True)
+    train_active = p_active.detach().clone()
+    train_always = p_always.detach().clone()
     old.eval()
 
     # Make cohort identity observable independently of the stochastic training trajectory.
@@ -171,6 +173,16 @@ with tempfile.TemporaryDirectory() as td:
        (exact.param_groups[0]["k"], exact.param_groups[1]["k"]))
     ck("Schedule-Free z survives Parameter replacement",
        "z" in exact.state[p_active_new] and "z" in exact.state[p_always_new])
+    ck("fresh rebound Parameters start in the saved eval representation",
+       torch.equal(p_active_new.detach(), eval_active)
+       and torch.equal(p_always_new.detach(), eval_always))
+    exact.train()
+    ck("train() reconstructs the pre-eval training representation after rebound",
+       torch.allclose(p_active_new.detach(), train_active, rtol=1e-6, atol=1e-7)
+       and torch.allclose(p_always_new.detach(), train_always, rtol=1e-6, atol=1e-7),
+       (float((p_active_new.detach() - train_active).abs().max()),
+        float((p_always_new.detach() - train_always).abs().max())))
+    exact.eval()
 
     # A different component window must start its own d state, while the always-on refiner
     # continues from its persistent cohort.
