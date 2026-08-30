@@ -4991,10 +4991,10 @@ def train_minimax(
         if limiter is not None:
             limiter.pre_step()           # snapshot BEFORE the optimizer moves anything
         if optimizer is not None:        # None under FT's fused backward (per-tensor hooks)
-            if _ft_prodigy and rotator is not None:
-                # Split Prodigy cohorts have independent clocks. A routed modality can freeze
-                # the entire rotating component group while the always-on refiner still has
-                # gradients; do not advance d/k/Schedule-Free state for that no-op cohort.
+            if _lora_prodigy or _ft_prodigy:
+                # Prodigy split groups have independent clocks. H3 routing can freeze an entire
+                # group (FT component cohort, or a LoRA depth-LR group) while another group still
+                # has gradients; do not advance d/k/Schedule-Free state for that no-op cohort.
                 step_active_optimizer_groups(optimizer)
             else:
                 optimizer.step()
