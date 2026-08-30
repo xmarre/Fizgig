@@ -246,28 +246,40 @@ def create_optimizer(name: str, params, lr: float, args_str: str = "",
 
 
 def step_active_optimizer_groups(optimizer) -> bool:
-    """Step only param groups that contain at least one gradient.
+    """Step Prodigy groups without advancing independent routed no-op cohorts.
 
-    Prodigy+ with split_groups=True advances group-level k/d/Schedule-Free statistics for every
-    group present in optimizer.param_groups, even when every tensor in one group has grad=None.
-    H3 rotation routing can intentionally produce exactly that shape: a component window may be
-    fully frozen for one modality while the always-on refiner still trains. Temporarily excluding
-    empty groups keeps no-op cohort optimizer clocks stationary, then restores the original
-    group list before zero_grad/state/save code can observe it.
+    With split_groups=True Prodigy keeps a separate adaptive clock per parameter group, so an
+    H3-routed group whose tensors are all grad=None must sit the step out. With
+    split_groups=False the groups intentionally share one Prodigy clock; filtering one out
+    would instead split that shared state, so the ordinary optimizer step is preserved. When
+    split_groups_mean=True, active groups step independently and the documented harmonic mean
+    is then recomputed across the complete logical group set, including routed no-op groups.
     """
     groups = optimizer.param_groups
     active = [group for group in groups
               if any(param.grad is not None for param in group.get("params", ()))]
     if not active:
         return False
-    if len(active) == len(groups):
+
+    first = groups[0]
+    if not bool(first.get("split_groups", False)) or len(active) == len(groups):
         optimizer.step()
         return True
+
+    use_group_mean = bool(first.get("split_groups_mean", False))
     optimizer.param_groups = active
     try:
         optimizer.step()
     finally:
         optimizer.param_groups = groups
+
+    if use_group_mean:
+        ds = [float(group["d"]) for group in groups]
+        if any(d <= 0 for d in ds):
+            raise RuntimeError("Prodigy+ group d must stay positive when computing split_groups_mean")
+        d_mean = len(ds) / sum(1.0 / d for d in ds)
+        for group in groups:
+            group["shared_d"] = d_mean
     return True
 
 

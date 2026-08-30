@@ -110,6 +110,46 @@ ck("live Prodigy cohort advances independently",
 ck("active-group stepping restores the optimizer group list",
    len(route_opt.param_groups) == 2)
 
+# Non-split groups are one logical Prodigy clock. An empty routed group must remain present so
+# upstream can copy the shared d/k state across every group at the end of the step.
+p_shared_empty = nn.Parameter(torch.randn(4, 4))
+p_shared_live = nn.Parameter(torch.randn(4, 4))
+shared_opt, _ = create_optimizer(
+    "prodigyplus",
+    [{"params": [p_shared_empty]}, {"params": [p_shared_live]}],
+    1e-4, "stochastic_rounding=False split_groups=False")
+p_shared_live.grad = torch.randn_like(p_shared_live)
+step_active_optimizer_groups(shared_opt)
+ck("non-split routed groups keep one shared step clock",
+   [int(g["k"]) for g in shared_opt.param_groups] == [2, 2],
+   [g["k"] for g in shared_opt.param_groups])
+ck("non-split routed groups keep one shared d",
+   float(shared_opt.param_groups[0]["d"]) == float(shared_opt.param_groups[1]["d"]),
+   [g["d"] for g in shared_opt.param_groups])
+
+# split_groups_mean keeps independent k/d histories but deploys the harmonic mean across the
+# entire logical set, including a group that was routed out for this step.
+p_mean_empty = nn.Parameter(torch.randn(4, 4))
+p_mean_live = nn.Parameter(torch.randn(4, 4))
+mean_opt, _ = create_optimizer(
+    "prodigyplus",
+    [{"params": [p_mean_empty]}, {"params": [p_mean_live]}],
+    1e-4, "stochastic_rounding=False split_groups_mean=True")
+mean_opt.param_groups[0]["d"] = 1e-6
+mean_opt.param_groups[1]["d"] = 4e-6
+p_mean_live.grad = torch.randn_like(p_mean_live)
+step_active_optimizer_groups(mean_opt)
+_expected_mean = 2.0 / (
+    1.0 / float(mean_opt.param_groups[0]["d"])
+    + 1.0 / float(mean_opt.param_groups[1]["d"]))
+ck("split-groups-mean leaves the routed no-op clock stationary",
+   int(mean_opt.param_groups[0]["k"]) == 1 and int(mean_opt.param_groups[1]["k"]) == 2,
+   [g["k"] for g in mean_opt.param_groups])
+ck("split-groups-mean is recomputed over every logical group",
+   all(abs(float(g["shared_d"]) - _expected_mean) <= 1e-15
+       for g in mean_opt.param_groups),
+   [g["shared_d"] for g in mean_opt.param_groups])
+
 # Schedule-Free mode transitions are real and reversible at the API/state level.
 p2 = nn.Parameter(torch.randn(8, 8))
 opt2, _ = create_optimizer("prodigyplus", [p2], 1e-4, "stochastic_rounding=False")
