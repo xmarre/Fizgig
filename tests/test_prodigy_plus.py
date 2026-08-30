@@ -198,6 +198,28 @@ with tempfile.TemporaryDirectory() as td:
     ck("same filename/epoch with a different state id is not an exact resume",
        not store.matches_checkpoint("run-000003.safetensors", 3, "state-b"))
 
+    # Exact resume also requires the persisted sidecar snapshot to be complete. A partial copy
+    # or truncated state file must fail closed before any optimizer state is rebound.
+    _group_file = store._group_path("window:fc1")
+    _group_backup = _group_file + ".check"
+    os.replace(_group_file, _group_backup)
+    try:
+        ck("missing sidecar state invalidates exact resume",
+           not store.matches_checkpoint("run-000003.safetensors", 3, state_id))
+    finally:
+        os.replace(_group_backup, _group_file)
+    _group_size = os.path.getsize(_group_file)
+    with open(_group_file, "ab") as _f:
+        _f.write(b"x")
+    try:
+        ck("sidecar size mismatch invalidates exact resume",
+           not store.matches_checkpoint("run-000003.safetensors", 3, state_id))
+    finally:
+        with open(_group_file, "r+b") as _f:
+            _f.truncate(_group_size)
+    ck("restored sidecar inventory matches again",
+       store.matches_checkpoint("run-000003.safetensors", 3, state_id))
+
     p_active_new = nn.Parameter(eval_active.clone())
     p_always_new = nn.Parameter(eval_always.clone())
     exact_groups = [

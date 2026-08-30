@@ -439,24 +439,49 @@ class RotatingOptimizerStateStore:
         self.last_group_restore_count = restored_groups
         return restored
 
+    def _state_inventory(self) -> dict:
+        """Return final sidecar state filenames and sizes, excluding transient files."""
+        try:
+            names = sorted(name for name in os.listdir(self.root)
+                           if ((name.startswith("group-") or name.startswith("param-"))
+                               and name.endswith(".pt")))
+            return {name: os.path.getsize(os.path.join(self.root, name)) for name in names}
+        except OSError:
+            return {}
+
     def mark_checkpoint(self, checkpoint_path: str, epoch: int, state_id: str) -> None:
         if not state_id:
             raise ValueError("rotating optimizer checkpoint state_id must be non-empty")
+        files = self._state_inventory()
+        if not any(name.startswith("group-") for name in files):
+            raise RuntimeError("cannot mark Prodigy+ checkpoint without persisted group state")
         self._write_manifest({
             "checkpoint": os.path.basename(os.path.abspath(checkpoint_path)),
             "epoch": int(epoch),
             "state_id": str(state_id),
+            "files": files,
         })
 
     def matches_checkpoint(self, checkpoint_path: str, epoch: int, state_id: str) -> bool:
         if not state_id:
             return False
         manifest = self._read_manifest()
+        files = manifest.get("files")
+        if not isinstance(files, dict) or not files:
+            return False
+        try:
+            files_match = all(
+                isinstance(name, str) and isinstance(size, int)
+                and os.path.getsize(os.path.join(self.root, name)) == size
+                for name, size in files.items())
+        except OSError:
+            files_match = False
         return (
             manifest.get("checkpoint") == os.path.basename(os.path.abspath(checkpoint_path))
             and int(manifest.get("epoch", -1)) == int(epoch)
             and manifest.get("state_id") == str(state_id)
-            and self._has_group_state()
+            and files_match
+            and any(name.startswith("group-") for name in files)
         )
 
     def cleanup(self) -> None:
