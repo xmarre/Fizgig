@@ -229,6 +229,7 @@ Every control has a hint in the app; the highlights:
 - **Multi Concept** — two subjects, two folders, two trigger words, one LoRA. Each subject's images are only ever compared against their own.
 - **Adapter-relative LR** (default Off) — the LR box becomes a ceiling the run climbs toward, keeping each step proportional to the adapter's size. Worth trying when a run overshoots early.
 - **Caption dropout** (default 0.05) and **Weight averaging (EMA)** (default Off) — leave dropout on; switch EMA on when pushing LR hard.
+- **Optimizer** — full-precision **AdamW remains the validated MiniMax LoRA default**. **Prodigy+ Schedule-Free** is available as an opt-in optimizer. Prodigy+ owns its step size (`lr=1` is its multiplier), so the ordinary Learning Rate value is recorded rather than used as Prodigy's optimizer LR. Fizgig disables external gradient clipping when Prodigy+ already normalizes update scale, including the default StableAdamW path and Adam-atan2 (`eps=None`). Max Grad Norm remains available only with numeric `eps` and `use_stableadamw=False`. Fizgig refuses combinations that rewrite or post-correct the optimizer trajectory (Adaptive LR, adapter LR ramp, LR warmup, high-noise LR scaling, anchor-LR retirement, identity-first LR phasing, the movement clip, and EMA while Schedule-Free is active). Extra Prodigy+ options go in **Optimizer Args**, for example `betas=(0.95,0.99) schedulefree_c=8`.
 - **Using the Turbo LoRA in ComfyUI? Skip its custom sampler** — current ComfyUI samples H3 audio cleanly with stock Euler; community consensus is 8 steps, with `minimax_h3_turbo_v4_step600_ema` the strongest checkpoint.
 
 Settings are read at launch; Pause → Resume relaunches with your current settings, so a pause is the moment to change them mid-run.
@@ -401,8 +402,29 @@ the model's full depth from the very first epoch.
   to disk automatically when RAM is tight — full-model fine-tuning runs on a 64 GB box.
 - **Disk:** each save is a full **~21 GB** int8 checkpoint — set the Training tab's **Output
   Directory** to a drive with room *before* the run, or you'll be moving 20 GB files by hand after.
-- **Learning rate: 3e-5** — the tested fast-and-reliable rate for H3 fine-tuning. Anything as
-  high as 1e-4 will destroy a fine-tune.
+- **Learning rate: 3e-5 with the default Adafactor optimizer** — the tested fast-and-reliable
+  H3 fine-tune recipe. A rate as high as 1e-4 destroys this Adafactor fine-tune.
+- **Prodigy+ Schedule-Free is an optional H3 full-finetune optimizer.** Select it inside the
+  full-finetune card. Prodigy+ uses its own adaptive `d` with an LR multiplier of 1 and disables
+  optimizer-in-backward. Default StableAdamW and Adam-atan2 (`eps=None`) both disable external
+  clipping; Max Grad Norm remains available only with numeric `eps` and
+  `use_stableadamw=False`. It receives a more conservative
+  rotation-window plan for its live gradient/Schedule-Free state. The existing Adafactor path
+  remains the default and retains the measured VRAM tiers above. Prodigy+'s extra VRAM model is
+  conservative arithmetic from its state layout; it has not yet been field-calibrated on H3.
+- **Prodigy+ rotation state is disk-backed.** Fizgig writes a hidden
+  `.<output-name>.prodigyplus-ft-state` directory beside the output checkpoints. It carries
+  per-component adaptive `d`/step state, a separate always-on refiner cohort, per-weight
+  moments and Schedule-Free `z` across fresh Parameter objects at every rotation. A component
+  never inherits another component's learned stepsize. Each save stamps the checkpoint and
+  sidecar with the same state ID, so exact optimizer resume is accepted only for the checkpoint
+  that actually produced that sidecar state.
+  The directory can become large because it eventually contains optimizer state for every
+  trained window; keep it when continuing the run and delete it when optimizer resume is no
+  longer needed. Reduced-LR regularisation images are currently Adafactor-only; with Prodigy+
+  either leave the regularisation folder empty or set **LR × = 1.0** for full-strength
+  class-balanced examples. Full-finetune `split_groups=False` and
+  `split_groups_mean=True` are rejected because both collapse the independent rotation cohorts.
 - **Use unique trigger tokens** — strongly recommended: an invented token gives the fine-tune
   somewhere clean to bind, where a common word drags its existing meaning along with it.
 - **Run length: there's no standard number.** It depends on learning rate, dataset size and
@@ -437,8 +459,10 @@ much lower learning rates than LoRAs**. A LoRA nudges a small adapter riding on 
 model; a fine-tune moves the model's own weights, so the rates you're used to typing land
 very differently here — what's a normal LoRA rate can wreck a fine-tune outright.
 
-- **MiniMax H3: use 3e-5.** It's the tested fast-and-reliable rate; **1e-4 will destroy an
-  H3 fine-tune** — that one is measured, not folklore.
+- **MiniMax H3 + Adafactor: use 3e-5.** It's the tested fast-and-reliable rate; **1e-4 will
+  destroy an H3 Adafactor fine-tune** — that one is measured.
+- **MiniMax H3 + Prodigy+: leave Prodigy's multiplier at 1.** The optimizer estimates its own
+  step size; the Training tab's ordinary Learning Rate value does not become Prodigy's LR.
 - **Krea 2: you're welcome to start at 1e-4** — it trains — but realistically the best
   results are found lower. Treat 1e-4 as the top of the experiment range, not the recipe:
   when a run looks almost right but slightly overcooked, the next move is a lower rate,

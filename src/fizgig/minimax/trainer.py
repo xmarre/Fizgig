@@ -2419,6 +2419,8 @@ def train_minimax(
     finetune_rotate_every: int = 1,
     finetune_rotation_mode: str = "component",
     finetune_start_window: int = 0,
+    finetune_optimizer_type: str = "adafactor",
+    finetune_optimizer_args: str = "",
     finetune_fused_backward: bool = True,
     finetune_scope: str = "all",            # "all" | "photo"
     finetune_blocks: str = None,
@@ -2435,7 +2437,10 @@ def train_minimax(
     from fizgig.dataset.config import (BlueprintGenerator, ConfigSanitizer,
                                        generate_dataset_group_by_blueprint, load_user_config)
     from fizgig.networks.lora import create_network
-    from fizgig.training.optimizers import create_optimizer
+    from fizgig.training.optimizers import (RotatingOptimizerStateStore, create_optimizer,
+                                            is_prodigy_plus, optimizer_uses_schedulefree,
+                                            parse_optimizer_args, prodigy_handles_gradient_scaling,
+                                            step_active_optimizer_groups)
     from fizgig.training.train_utils import LossRecorder, validate_output_name
     from fizgig.training.metadata import build_metadata, resolve_title, ARCHITECTURE_MINIMAX
     from fizgig.minimax.loader import load_minimax_h3_dit
@@ -2455,6 +2460,52 @@ def train_minimax(
     # Mirrors krea2/trainer.py's FT coercion block. Everything forced here is forced for a
     # structural reason, not taste — each line names it.
     ft_rotation = max(0, int(finetune_rotation or 0))
+    _lora_prodigy = bool(not ft_rotation and is_prodigy_plus(optimizer_type))
+    _lora_schedulefree = bool(
+        _lora_prodigy and optimizer_uses_schedulefree(optimizer_type, optimizer_args))
+    _lora_prodigy_kwargs = (parse_optimizer_args(optimizer_args)
+                            if _lora_prodigy else {})
+    _ft_prodigy = bool(ft_rotation and is_prodigy_plus(finetune_optimizer_type))
+    _ft_prodigy_schedulefree = bool(
+        _ft_prodigy and optimizer_uses_schedulefree("prodigyplus", finetune_optimizer_args))
+    _ft_prodigy_kwargs = (parse_optimizer_args(finetune_optimizer_args)
+                          if _ft_prodigy else {})
+    _ft_window_cost_scale = 1.0
+    _ft_fixed_optimizer_gb = 0.0
+
+    if not ft_rotation and _lora_prodigy:
+        conflicts = []
+        if adaptive_lr:
+            conflicts.append("Adaptive LR")
+        if adapter_ramp and float(adapter_ramp) > 0:
+            conflicts.append("Adapter-relative LR")
+        if lr_warmup_epochs and float(lr_warmup_epochs) > 0:
+            conflicts.append("LR warmup")
+        if abs(float(highnoise_lr_scale or 1.0) - 1.0) > 1e-9:
+            conflicts.append("Medium to High LR")
+        if ((int(visual_stop_epoch or 0) and visual_stop_mode == "anchor")
+                or (int(audio_stop_epoch or 0) and audio_stop_mode == "anchor")):
+            conflicts.append("category anchor LR")
+        if distill and int(distill_phase1_epochs if distill_phase1_epochs is not None else -1) != 0:
+            conflicts.append("identity-first distillation LR phase")
+        if block_limit and float(block_limit) > 0:
+            conflicts.append("per-step movement clip")
+        if _lora_schedulefree and ema_decay and float(ema_decay) > 0:
+            conflicts.append("EMA (Schedule-Free already owns the deploy average)")
+        if conflicts:
+            raise RuntimeError(
+                "[optimizer] Prodigy+ owns its learning-rate/update trajectory and cannot be "
+                "combined with: " + ", ".join(conflicts) + ". Disable those controls for this run.")
+        _lora_internal_scaling = prodigy_handles_gradient_scaling(optimizer_args)
+        if max_grad_norm and float(max_grad_norm) > 0 and _lora_internal_scaling:
+            logger.info("[optimizer] Prodigy+ StableAdamW handles update scaling internally — "
+                        "disabling external gradient clipping (max_grad_norm %.3g -> 0).",
+                        max_grad_norm)
+            max_grad_norm = 0.0
+        elif max_grad_norm and float(max_grad_norm) > 0:
+            logger.info("[optimizer] Prodigy+ internal StableAdamW scaling is disabled — "
+                        "honouring external max_grad_norm %.3g.", max_grad_norm)
+
     rotator = None
     ft_subset = None
     ft_epoch_offset = 0
@@ -2490,6 +2541,55 @@ def train_minimax(
         if finetune_scope not in ("all", "photo"):
             raise RuntimeError(f"[h3-ft] finetune_scope must be 'all' or 'photo', "
                                f"got {finetune_scope!r}")
+        _ft_opt_key = ("prodigyplus" if _ft_prodigy
+                       else str(finetune_optimizer_type or "adafactor").strip().lower())
+        if _ft_opt_key not in ("adafactor", "prodigyplus"):
+            raise RuntimeError(
+                f"[h3-ft] unsupported fine-tune optimizer {finetune_optimizer_type!r}; "
+                "choose adafactor or prodigyplus")
+        if _ft_prodigy:
+            if bool(_ft_prodigy_kwargs.get("fused_back_pass", False)):
+                raise RuntimeError(
+                    "[h3-ft] Prodigy+ fused_back_pass is not supported by the rotation trainer: "
+                    "per-modality requires_grad routing means not every hook fires on every step, "
+                    "which would leave Prodigy's step accounting incomplete.")
+            if not bool(_ft_prodigy_kwargs.get("split_groups", True)):
+                raise RuntimeError(
+                    "[h3-ft] Prodigy+ split_groups=False is incompatible with rotation: the "
+                    "active component and always-on refiner need independent persistent d/state "
+                    "cohorts so a component-specific stepsize is not inherited by another window.")
+            if bool(_ft_prodigy_kwargs.get("split_groups_mean", False)):
+                raise RuntimeError(
+                    "[h3-ft] Prodigy+ split_groups_mean=True is incompatible with rotation: "
+                    "the active component group changes at each window boundary, so a shared "
+                    "harmonic-mean d would be stale on the first step after every rotation.")
+            if finetune_fused_backward:
+                logger.info("[h3-ft] Prodigy+ selected — disabling optimizer-in-backward; "
+                            "the rotating trainer uses one coherent optimizer step with separate "
+                            "persistent d/state cohorts for the live component and refiner.")
+            finetune_fused_backward = False
+            _ft_internal_scaling = prodigy_handles_gradient_scaling(finetune_optimizer_args)
+            if max_grad_norm and float(max_grad_norm) > 0 and _ft_internal_scaling:
+                logger.info("[h3-ft] Prodigy+ StableAdamW handles update scaling internally — "
+                            "disabling external gradient clipping (max_grad_norm %.3g -> 0).",
+                            max_grad_norm)
+                max_grad_norm = 0.0
+            elif max_grad_norm and float(max_grad_norm) > 0:
+                logger.info("[h3-ft] Prodigy+ internal StableAdamW scaling is disabled — "
+                            "honouring external max_grad_norm %.3g.", max_grad_norm)
+            # Persistent bf16 z/gradient state is roughly 3x the active bf16 weights, and
+            # step() materializes fp32 y/z/grad/denom one tensor at a time. 3.5x is the
+            # conservative factored-state planner coefficient; full second moments need more.
+            _ft_window_cost_scale = (
+                4.5 if (not bool(_ft_prodigy_kwargs.get("factored", True))
+                        or bool(_ft_prodigy_kwargs.get("use_focus", False))) else 3.5)
+            # The calibrated 14.5 GB Adafactor overhead already contains the ~0.4 GB
+            # always-on token refiner. Prodigy adds persistent z + an unfused gradient
+            # there too, so budget only the incremental state beyond the measured 1x.
+            _ft_fixed_optimizer_gb = 0.4 * (_ft_window_cost_scale - 1.0)
+            logger.info("[h3-ft] Prodigy+ planner: active-window memory cost x%.1f + %.1f GB "
+                        "always-on optimizer state (unfused gradients + adaptive/SF state).",
+                        _ft_window_cost_scale, _ft_fixed_optimizer_gb)
         if finetune_blocks:
             parse_block_spec(finetune_blocks)   # early typo check; bounds after the load
         # Continuation numbering (mirrors krea2): a fine-tune continued from a saved
@@ -2497,17 +2597,19 @@ def train_minimax(
         # silently OVERWRITE the original run's first checkpoint. The --dit file IS the
         # previous checkpoint — offset every checkpoint filename by its trailing epoch
         # number (the FINAL file has no number; its count rides in fizgig_ft_epochs_done).
+        _ft_source_md = {}
+        try:
+            from safetensors import safe_open
+            with safe_open(dit_path, framework="pt") as _f:
+                _ft_source_md = _f.metadata() or {}
+        except Exception:
+            _ft_source_md = {}
         _m = re.search(r"-(\d{6})\.safetensors$", os.path.basename(dit_path or ""))
         if _m:
             ft_epoch_offset = int(_m.group(1))
         else:
-            try:
-                from safetensors import safe_open
-                with safe_open(dit_path, framework="pt") as _f:
-                    _md = _f.metadata() or {}
-                ft_epoch_offset = int(_md.get("fizgig_ft_epochs_done", 0))
-            except Exception:
-                ft_epoch_offset = 0
+            ft_epoch_offset = int(_ft_source_md.get("fizgig_ft_epochs_done", 0) or 0)
+        _ft_resume_state_id = str(_ft_source_md.get("fizgig_prodigy_state_id", "") or "")
         if ft_epoch_offset:
             logger.info("[h3-ft] continuing from %s — checkpoint numbering starts at "
                         "epoch %d", os.path.basename(dit_path), ft_epoch_offset + 1)
@@ -2558,9 +2660,11 @@ def train_minimax(
                     "window is one matmul (qkv/out/fc1/fc2) across every block, so a "
                     "concept trains at full model depth each epoch. The frozen trunk "
                     "carries NF4's ~9.5%% error during training (the saved checkpoint "
-                    "is still exact int8, written from the bf16 master). Scope=%s%s%s.",
+                    "is still exact int8, written from the bf16 master). Scope=%s%s, "
+                    "optimizer=%s%s.",
                     finetune_scope,
                     f", blocks {finetune_blocks}" if finetune_blocks else "",
+                    "prodigyplus" if _ft_prodigy else "adafactor",
                     ", fused backward" if finetune_fused_backward else "")
         # FT has never been run on AMD/ROCm — every measured tier is NVIDIA, and the NF4
         # rotator leans on bitsandbytes 4-bit, the least-travelled part of the ROCm stack.
@@ -2580,6 +2684,16 @@ def train_minimax(
         blueprint.dataset_group, training=True, num_timestep_buckets=None, shared_epoch=shared_epoch)
     if group.num_train_items == 0:
         raise RuntimeError("No training items — run minimax_cache_latents then minimax_cache_text first.")
+    if _ft_prodigy:
+        _has_reg = any(getattr(_ds, "is_reg", False) for _ds in group.datasets)
+        if _has_reg and abs(float(reg_lr_multiplier) - 1.0) > 1e-9:
+            raise RuntimeError(
+                "[h3-ft] Prodigy+ cannot provide the regularisation-images LR multiplier "
+                f"x{float(reg_lr_multiplier):g}: its adaptive normalization can cancel a "
+                "constant loss/gradient scale. Set Regularisation LR × to 1.0 for full-strength "
+                "class-balanced examples, or remove the regularisation folder. Reduced-LR "
+                "regularisation remains supported by the default Adafactor path."
+            )
     logger.info(f"MiniMax H3 training: {group.num_train_items} items, {max_train_epochs} epochs")
 
     # FIZGIG_SAVED_TENSOR_AUDIT=1: account every tensor autograd saves for backward, with the
@@ -3098,7 +3212,9 @@ def train_minimax(
         _usable -= _act_gb + _act_margin_gb
         _windows, ft_stream, _plan_why = plan_h3_ft_windows(
             _usable, subset=ft_subset, n_blocks=_n_blocks,
-            allow_stream=os.environ.get("FIZGIG_NO_FT_STREAM") != "1")
+            allow_stream=os.environ.get("FIZGIG_NO_FT_STREAM") != "1",
+            window_cost_scale=_ft_window_cost_scale,
+            fixed_overhead_gb=_ft_fixed_optimizer_gb)
         for _line in _plan_why:
             logger.info("[h3-ft] %s", _line)
         if _windows is None:
@@ -3571,8 +3687,59 @@ def train_minimax(
                            f"({type(_ae).__name__}: {_ae}) — samples render silent")
         return _audio_dec_state["dec"]
 
-    params = rotator.trainable_params() if rotator is not None \
-        else list(network.get_trainable_params())
+    def _ft_named_trainable_groups():
+        """Stable logical names split into the rotating component and always-on cohort."""
+        if rotator is None:
+            return [], []
+        active, always, seen = [], [], set()
+        for key, lin in rotator._targets(list(rotator.active)):
+            for suffix, param in (("weight", lin.weight), ("bias", lin.bias)):
+                if param is None or not param.requires_grad or id(param) in seen:
+                    continue
+                name = key if suffix == "weight" else key[:-len(".weight")] + ".bias"
+                active.append((name, param))
+                seen.add(id(param))
+        for prefix, module in rotator.always:
+            for name, param in module.named_parameters():
+                if param.requires_grad and id(param) not in seen:
+                    always.append((f"{prefix}.{name}", param))
+                    seen.add(id(param))
+        return active, always
+
+    def _ft_refresh_named_params():
+        active, always = _ft_named_trainable_groups()
+        return active, always, active + always
+
+    _ft_named_active, _ft_named_always, _ft_named_params = _ft_refresh_named_params()
+    params = ([p for _, p in _ft_named_params] if rotator is not None
+              else list(network.get_trainable_params()))
+
+    _ft_optimizer_store = None
+    _ft_optimizer_resume = False
+    if _ft_prodigy:
+        _ft_state_root = os.path.join(output_dir, f".{output_name}.prodigyplus-ft-state")
+        _ft_optimizer_store = RotatingOptimizerStateStore(
+            _ft_state_root, fresh=(ft_epoch_offset == 0))
+        if ft_epoch_offset:
+            _ft_optimizer_resume = _ft_optimizer_store.matches_checkpoint(
+                dit_path, ft_epoch_offset, _ft_resume_state_id)
+            if _ft_optimizer_resume:
+                logger.info("[h3-ft] Prodigy+ optimizer state matches %s — restoring d, "
+                            "moments and per-window Schedule-Free state.",
+                            os.path.basename(dit_path))
+            else:
+                logger.warning("[h3-ft] no matching Prodigy+ optimizer sidecar for %s at "
+                               "epoch %d — weights resume exactly, optimizer adaptation "
+                               "restarts from d0. The sidecar must stay beside this run's "
+                               "output to resume Prodigy+ exactly.",
+                               os.path.basename(dit_path), ft_epoch_offset)
+                _ft_optimizer_store.cleanup()
+                _ft_optimizer_store = RotatingOptimizerStateStore(_ft_state_root, fresh=True)
+        logger.info("[h3-ft] Prodigy+ rotation state -> %s (inactive optimizer tensors are "
+                    "disk-backed so they do not pin VRAM/RAM).", _ft_state_root)
+
+    def _ft_new_optimizer_state_id():
+        return os.urandom(16).hex()
 
     # Per-modality confinement under FT (the routing decided in the rotator block): the
     # active window's Parameters that each modality must NOT touch, rebuilt per window.
@@ -3721,14 +3888,36 @@ def train_minimax(
                         format_block_spec(sorted(_ab_allowed)),
                         len(_audio_mask_params), len(params))
 
-    # FT ignores the Optimizer Type box (Krea parity): Adafactor's factored state is ~10x
-    # smaller than Adam's, which is part of what keeps a window inside 32 GB. Optionally
-    # fused into backward — one single-parameter optimizer per tensor, stepped from a
-    # post-accumulate hook so a gradient is consumed the moment it lands and the whole
-    # window's gradients never coexist.
+    # Rotation FT defaults to Adafactor because its factored state plus optimizer-in-backward
+    # is the measured low-VRAM recipe. Prodigy+ is an explicit alternative: its rotating
+    # component and always-on refiner are distinct adaptive groups whose state persists by
+    # logical identity while the Parameter objects are rebuilt.
     _fused = {"on": False, "opts": {}, "handles": []}
 
+    def _ft_prodigy_param_groups():
+        groups = []
+        if _ft_named_active:
+            groups.append({
+                "params": [p for _, p in _ft_named_active],
+                "lr_scale": 1.0,
+                "fizgig_state_key": "window:" + repr(tuple(rotator.active)),
+            })
+        if _ft_named_always:
+            groups.append({
+                "params": [p for _, p in _ft_named_always],
+                "lr_scale": 1.0,
+                "fizgig_state_key": "always",
+            })
+        if not groups:
+            raise RuntimeError("[h3-ft] Prodigy+ found no trainable parameters in this window")
+        return groups
+
     def _make_ft_optimizer(_params):
+        if _ft_prodigy:
+            opt, label = create_optimizer(
+                "prodigyplus", _ft_prodigy_param_groups(),
+                learning_rate, finetune_optimizer_args)
+            return opt, f"{label} (rotation)"
         try:
             from transformers.optimization import Adafactor
             return (Adafactor(_params, lr=learning_rate, scale_parameter=False,
@@ -3765,6 +3954,33 @@ def train_minimax(
             _fused["handles"].append(p.register_post_accumulate_grad_hook(_hook))
         _fused["on"] = True
 
+    def _optimizer_eval(_opt):
+        if (_opt is not None and hasattr(_opt, "eval")
+                and any(bool(g.get("use_schedulefree", False)) for g in _opt.param_groups)):
+            _opt.eval()
+
+    def _optimizer_train(_opt):
+        if (_opt is not None and hasattr(_opt, "train")
+                and any(bool(g.get("use_schedulefree", False)) for g in _opt.param_groups)):
+            _opt.train()
+
+    def _ft_bind_saved_state():
+        if not (_ft_prodigy and optimizer is not None and _ft_optimizer_store is not None):
+            return 0
+        restored = _ft_optimizer_store.bind(_ft_named_params, optimizer)
+        _optimizer_train(optimizer)
+        return restored
+
+    def _ft_stash_live(*, preserve_checkpoint_marker=False):
+        if not (_ft_prodigy and optimizer is not None and _ft_optimizer_store is not None):
+            return
+        # Schedule-Free's master/deploy representation is eval mode. Store that mode beside
+        # the z state, then deactivate: every inactive master tensor is always checkpoint-ready.
+        _optimizer_eval(optimizer)
+        _ft_optimizer_store.stash(
+            _ft_named_params, optimizer,
+            preserve_checkpoint_marker=preserve_checkpoint_marker)
+
     if rotator is not None:
         # opt_params is the non-FT path's alias of the FIRST window's param list — under FT
         # it would pin generation-1 params (3+ GB of bf16) for the whole run after the first
@@ -3778,7 +3994,19 @@ def train_minimax(
                         "as it lands (grad clipping and accumulation are off)")
         else:
             optimizer, optimizer_label = _make_ft_optimizer(params)
-        logger.info(f"optimizer: {optimizer_label} @ lr={learning_rate:.3e}")
+            _restored = _ft_bind_saved_state()
+            if _ft_optimizer_resume:
+                logger.info("[h3-ft] Prodigy+ rebound %d parameter state record(s), %d/%d "
+                            "adaptive group state record(s) into the continuation window.",
+                            _restored, _ft_optimizer_store.last_group_restore_count,
+                            len(optimizer.param_groups))
+        if _ft_prodigy:
+            logger.info("optimizer: %s (Prodigy+ lr multiplier %.4g; Learning Rate box %.3e "
+                        "is not the optimizer LR)", optimizer_label,
+                        optimizer.param_groups[0]["lr"] if optimizer is not None else 1.0,
+                        learning_rate)
+        else:
+            logger.info(f"optimizer: {optimizer_label} @ lr={learning_rate:.3e}")
     else:
         # eps_floor_8bit: H3-only. The 8-bit second moment underflows on this model's most
         # structured tensors and the update degrades to lr*m/eps — measured at ~100x the
@@ -3786,7 +4014,13 @@ def train_minimax(
         # is passed here and nowhere else: Krea 2 has never shown the failure.
         optimizer, optimizer_label = create_optimizer(optimizer_type, opt_params, learning_rate,
                                                       optimizer_args, eps_floor_8bit=True)
-        logger.info(f"optimizer: {optimizer_label} @ lr={learning_rate:.3e}")
+        _optimizer_train(optimizer)
+        if _lora_prodigy:
+            logger.info("optimizer: %s (Prodigy+ lr multiplier %.4g; Learning Rate box %.3e "
+                        "is not the optimizer LR)", optimizer_label,
+                        optimizer.param_groups[0]["lr"], learning_rate)
+        else:
+            logger.info(f"optimizer: {optimizer_label} @ lr={learning_rate:.3e}")
 
     limiter = None
     if block_limit and float(block_limit) > 0:
@@ -3964,6 +4198,7 @@ def train_minimax(
     if resume_state_dir:
         start_epoch, global_step, _resume_meta = _load_training_state(
             resume_state_dir, network, optimizer, device=device)
+        _optimizer_train(optimizer)
         if adaptive:
             adaptive.load_state_dict(_resume_meta.get("adaptive_lr_state"))
         if ema is not None:
@@ -4038,8 +4273,9 @@ def train_minimax(
     # WHOEVER OWNS THE LR SETS IT — and when nobody does, the configured value must win.
     # NOT an elif on the block above: warmup CONFIGURED but already FINISHED lands here too,
     # and that was exactly the case the first version of this fix missed.
-    if should_reassert_lr(resuming=bool(resume_state_dir), adaptive=adaptive, ramp=ramp,
-                          warmup_steps=warmup_steps, global_step=global_step):
+    if (not _lora_prodigy and
+            should_reassert_lr(resuming=bool(resume_state_dir), adaptive=adaptive, ramp=ramp,
+                               warmup_steps=warmup_steps, global_step=global_step)):
         _stale = float(optimizer.param_groups[0].get("lr", learning_rate))
         for _g in optimizer.param_groups:
             _g["lr"] = learning_rate * float(_g.get("lr_scale", 1.0))
@@ -4079,8 +4315,17 @@ def train_minimax(
             "ss_targeted_modules": str(_n_targeted),
             "ss_steps": str(global_step),
             "ss_epochs": str(max_train_epochs),
+            # Keep the conventional field numeric for Kohya/metadata consumers. Under
+            # Prodigy+ this is the configured UI value (not the optimizer's adaptive LR);
+            # the dedicated fields below make that distinction machine-readable.
             "ss_learning_rate": f"{learning_rate:g}",
+            "ss_learning_rate_semantics": (
+                "configured_reference_only;prodigyplus_self_tuning"
+                if (_lora_prodigy or _ft_prodigy) else "optimizer_lr"),
             "ss_optimizer": optimizer_label,
+            "ss_prodigy_lr_multiplier": (
+                f"{float((_ft_prodigy_kwargs if _ft_prodigy else parse_optimizer_args(optimizer_args)).get('lr', 1.0)):g}"
+                if (_lora_prodigy or _ft_prodigy) else ""),
             "ss_timestep_density": _dens,
             "ss_highnoise_lr_scale": f"{float(highnoise_lr_scale):g}",
             "ss_train_blocks": _blocks_used,
@@ -4680,17 +4925,25 @@ def train_minimax(
         3+ GB of zombie weights alive while the new params accumulate un-stepped, un-freed
         gradients (field bug: 29.5 GB peak on a 24 GB window, and the window silently not
         training after an epoch-0 preview)."""
-        nonlocal params, optimizer
-        params = rotator.trainable_params()
+        nonlocal params, optimizer, _ft_named_active, _ft_named_always, _ft_named_params
+        _ft_named_active, _ft_named_always, _ft_named_params = _ft_refresh_named_params()
+        params = [p for _, p in _ft_named_params]
         if finetune_fused_backward:
             _attach_fused(params)
         else:
             optimizer, _ = _make_ft_optimizer(params)
+            _restored = _ft_bind_saved_state()
+            if _ft_prodigy:
+                logger.info("[h3-ft] Prodigy+ rebound %d/%d parameter state record(s), "
+                            "%d/%d adaptive group state record(s) for the live window.",
+                            _restored, len(_ft_named_params),
+                            _ft_optimizer_store.last_group_restore_count,
+                            len(optimizer.param_groups))
         # Fresh Parameter objects -> the modality freeze lists must be rebuilt too, or
         # they'd freeze the deactivated window's orphans and leave the live one open.
         _ft_rebuild_freeze()
 
-    def _ft_render_previews(n):
+    def _ft_render_previews(n, preserve_optimizer_checkpoint=False):
         """Cycle-boundary preview under rotation FT: deactivate the whole window so the model
         is a consistent all-ConvRot checkpoint (the master holds every trained weight —
         reactivation-exactness is test-pinned), apply the Turbo FRESH against it, run the
@@ -4702,6 +4955,11 @@ def train_minimax(
         import gc as _gc
         _act = list(rotator.active)
         if _act:
+            if _ft_prodigy:
+                # The preview must see Schedule-Free's deploy/eval representation. Persist
+                # matching z/moments before the Parameter objects disappear.
+                _ft_stash_live(
+                    preserve_checkpoint_marker=bool(preserve_optimizer_checkpoint))
             rotator.deactivate(_act)
             # Drop every optimizer reference to the window's now-orphaned bf16 Parameters —
             # the fused opts dict is KEYED on them, so without this they stay VRAM-resident
@@ -4882,7 +5140,8 @@ def train_minimax(
         # `or _hn_active or _retire_active` is not decoration: warmup is retired for this
         # family and the ramp is OFF in the Fast preset, so without them this block never
         # runs for the preset most people use and the settings would silently do nothing.
-        if warmup_steps or ramp is not None or _p1_epochs or _hn_active or _retire_active:
+        if (not _lora_prodigy and
+                (warmup_steps or ramp is not None or _p1_epochs or _hn_active or _retire_active)):
             _wf = (min(1.0, (global_step + 1) / warmup_steps) if warmup_steps else 1.0)
             _rm = ramp.mult if ramp is not None else 1.0
             for _g in optimizer.param_groups:
@@ -4890,7 +5149,13 @@ def train_minimax(
         if limiter is not None:
             limiter.pre_step()           # snapshot BEFORE the optimizer moves anything
         if optimizer is not None:        # None under FT's fused backward (per-tensor hooks)
-            optimizer.step()
+            if _lora_prodigy or _ft_prodigy:
+                # Prodigy split groups have independent clocks. H3 routing can freeze an entire
+                # group (FT component cohort, or a LoRA depth-LR group) while another group still
+                # has gradients; do not advance d/k/Schedule-Free state for that no-op cohort.
+                step_active_optimizer_groups(optimizer)
+            else:
+                optimizer.step()
             optimizer.zero_grad(set_to_none=True)
         if limiter is not None:
             limiter.step()
@@ -4905,10 +5170,10 @@ def train_minimax(
         if network is not None:
             network.train()
         if rotator is not None:
-            # Rotate BEFORE the epoch's first step. The optimizer (or the fused per-tensor
-            # set) is rebuilt from scratch each window — the outgoing window's Adafactor
-            # state is meaningless to the incoming one — and `params` is REASSIGNED so
-            # clip_grad_norm_ and the boundary step see the live window, not the old one.
+            # Rotate BEFORE the epoch's first step. Adafactor rebuilds per window; Prodigy+
+            # rebuilds the optimizer object around the fresh Parameters and rebinds persisted
+            # state by stable tensor name. `params` is REASSIGNED so clipping/boundary logic
+            # always sees the live window rather than the previous generation.
             _want = _ft_want(epoch)
             if _want != list(rotator.active):
                 # Decomposed rotate_to (deactivate -> activate is exactly what it does) so a
@@ -4922,6 +5187,11 @@ def train_minimax(
                 # post-deactivate free is too tight for the incoming window.
                 _act_now = list(rotator.active)
                 if _act_now:
+                    if _ft_prodigy:
+                        # Store eval/master weights plus optimizer state before rotation. This
+                        # keeps every inactive master tensor checkpoint-ready and carries the
+                        # component/refiner adaptive groups + per-weight state forward.
+                        _ft_stash_live()
                     # Release the optimizer's grip BEFORE deactivating — the fused opts are
                     # KEYED on the outgoing window's Parameters, and _ft_rebind_optimizer
                     # only runs after the next window activates, so without this every
@@ -4944,10 +5214,11 @@ def train_minimax(
                     _free_r = _pfv()
                 except Exception:
                     _free_r = 99.0
-                # Component window: projected bf16 size of the incoming spec — depth-split
-                # entries count only their slice, so a 17-block fc1 chunk no longer reads
-                # as the full-depth 15.4 GB.
-                _need_r = _ft_window_gb(_want) + 2.0
+                # Incoming live-window requirement. Adafactor's scale is 1.0, preserving the
+                # measured path exactly. Prodigy+ uses the same >1 coefficient as launch-time
+                # planning so state/gradient restoration cannot bypass the admission budget.
+                _need_r = (_ft_window_gb(_want) * _ft_window_cost_scale
+                           + _ft_fixed_optimizer_gb + 2.0)
                 if _free_r < _need_r and not ft_stream:
                     logger.info("[h3-ft] %.1f GB free before activating the next window "
                                 "(needs ~%.1f) — defragmenting via a full park/restore "
@@ -5112,14 +5383,11 @@ def train_minimax(
             # so avr_loss and the drift lines see unscaled numbers (Krea 2 FT parity).
             #
             # Honesty note (review, 26 Aug — and the exception to _boundary_step's
-            # "never the loss" doctrine): Adafactor's second-moment normalisation
-            # partially cancels a constant gradient scale, so x0.2 realises as roughly
-            # x0.2-0.25 ONLY while reg steps are the minority feeding each tensor's EMA
-            # (the [reg] majority warning above is that condition). The very first step
-            # after each rotation rebind is fully UNthrottled (fresh state: beta2t=0
-            # makes the update scale-invariant) — ~one stray full-LR reg step per
-            # rotation at typical reg ratios. Krea 2 FT has identical behaviour; the
-            # doctrine comment stays right for everything that CAN ride param-group LR.
+            # "never the loss" doctrine): this reduced-loss approximation is Adafactor-only.
+            # Its second-moment normalisation partially cancels a constant gradient scale, so
+            # x0.2 realises as roughly x0.2-0.25 while reg steps remain the minority feeding
+            # each tensor's EMA. Prodigy+ rejects reduced-LR regularisation up front rather than
+            # pretending this approximation transfers to its adaptive d estimator.
             _bk = loss
             if reg_keys and any(str(k) in reg_keys for k in (batch.get("item_keys") or ())):
                 _bk = loss * reg_mult
@@ -5167,12 +5435,18 @@ def train_minimax(
                     "[h3-ft] category retirement left this epoch with nothing to train — "
                     "every batch belongs to a retired category. Lower the stop epoch, or "
                     "end the run at it with Max Epochs.")
+        if (_lora_prodigy or _ft_prodigy) and optimizer is not None:
+            for _gi, _g in enumerate(optimizer.param_groups):
+                _d = float(_g.get("d", 0.0))
+                _eff = float(_g.get("effective_lr", _g.get("lr", 1.0)))
+                logger.info("[prodigy+] group %d: d=%.4e effective_multiplier=%.4e "
+                            "effective_lr=%.4e", _gi, _d, _eff, _d * _eff)
         # Optimizer sanity: lora_up starts at zero and an Adam-family step is bounded by ~lr, so
         # after N steps no element can honestly exceed ~3*N*lr. When the 8-bit second moment
         # misbehaves (v quantized to zero -> update degrades to lr*m/eps) the drift blows through
         # that bound by orders of magnitude — caught here per epoch instead of per melted preview.
         # LoRA-specific by construction — FT's movement signal is the per-window write-back log.
-        if rotator is None:
+        if rotator is None and not _lora_prodigy:
             try:
                 _lr_now = optimizer.param_groups[0]["lr"]
                 _drift = max((float(l.lora_up.weight.detach().abs().max())
@@ -5231,25 +5505,40 @@ def train_minimax(
         if save_every_n_epochs and (epoch + 1) % save_every_n_epochs == 0 and (epoch + 1) < max_train_epochs:
             ckpt = os.path.join(output_dir, f"{output_name}-{epoch + 1:06d}.safetensors")
             if rotator is not None:
-                # The full checkpoint IS the resumable state under FT (the continuation is
-                # --dit <this file> + the printed start_window). ~21 GB per save.
+                # The full checkpoint IS the resumable weight state. Prodigy+ additionally
+                # keeps an optimizer sidecar so d/moments survive rotation and latest-checkpoint
+                # continuation without inflating every ~21 GB model save.
                 from fizgig.minimax.rotation_ft import save_full_checkpoint_h3
                 ckpt = os.path.join(output_dir,
                                     f"{output_name}-{epoch + 1 + ft_epoch_offset:06d}.safetensors")
                 _next_w = rot_schedule.window_at(epoch + 1)
-                save_full_checkpoint_h3(rotator, dit_path, ckpt, extra_metadata={
-                    **_meta(), "fizgig_next_start_window": str(_next_w),
-                    "fizgig_ft_n_windows": str(rot_schedule.n_windows),
-                    "fizgig_ft_epochs_done": str(epoch + 1 + ft_epoch_offset)})
+                if _ft_prodigy and optimizer is not None:
+                    _ft_stash_live()
+                _ft_state_id = (_ft_new_optimizer_state_id()
+                                if _ft_optimizer_store is not None else "")
+                try:
+                    save_full_checkpoint_h3(rotator, dit_path, ckpt, extra_metadata={
+                        **_meta(), "fizgig_next_start_window": str(_next_w),
+                        "fizgig_ft_n_windows": str(rot_schedule.n_windows),
+                        "fizgig_ft_epochs_done": str(epoch + 1 + ft_epoch_offset),
+                        **({"fizgig_prodigy_state_id": _ft_state_id}
+                           if _ft_state_id else {})})
+                    if _ft_optimizer_store is not None:
+                        _ft_optimizer_store.mark_checkpoint(
+                            ckpt, epoch + 1 + ft_epoch_offset, _ft_state_id)
+                finally:
+                    _optimizer_train(optimizer)
                 ft_ckpt_saved_this_epoch = True
                 logger.info("[h3-ft] to continue from this checkpoint: --dit %s "
                             "--finetune_start_window %d", os.path.basename(ckpt), _next_w)
             else:
                 if ema is not None:
                     ema.swap_in()
+                _optimizer_eval(optimizer)
                 try:
                     _save_lora(network, ckpt, network_dim, network_alpha, dtype, _meta())
                 finally:
+                    _optimizer_train(optimizer)
                     if ema is not None:
                         ema.swap_out()
             logger.info(f"saved {ckpt}")
@@ -5291,13 +5580,19 @@ def train_minimax(
                 # the saved checkpoint will look like, not the raw zigzag the EMA exists to hide.
                 if ema is not None:
                     ema.swap_in()
+                if rotator is None:
+                    _optimizer_eval(optimizer)
                 try:
                     if rotator is not None:
-                        _ft_render_previews(epoch + 1)
+                        _ft_render_previews(
+                            epoch + 1,
+                            preserve_optimizer_checkpoint=ft_ckpt_saved_this_epoch)
                     else:
                         _render_previews(epoch + 1)
                     vram_line("post-preview")
                 finally:
+                    if rotator is None:
+                        _optimizer_train(optimizer)
                     if ema is not None:
                         ema.swap_out()
             except Exception as _pe:
@@ -5340,10 +5635,19 @@ def train_minimax(
                     # checkpoint above, don't rewrite the identical file — same dedupe as the
                     # LoRA path's state_saved_this_epoch.
                     if not ft_ckpt_saved_this_epoch:
+                        if _ft_prodigy and optimizer is not None:
+                            _ft_stash_live()
+                        _ft_state_id = (_ft_new_optimizer_state_id()
+                                        if _ft_optimizer_store is not None else "")
                         save_full_checkpoint_h3(rotator, dit_path, _pp, extra_metadata={
                             **_meta(), "fizgig_next_start_window": str(_next_w),
                             "fizgig_ft_n_windows": str(rot_schedule.n_windows),
-                            "fizgig_ft_epochs_done": str(epoch + 1 + ft_epoch_offset)})
+                            "fizgig_ft_epochs_done": str(epoch + 1 + ft_epoch_offset),
+                            **({"fizgig_prodigy_state_id": _ft_state_id}
+                               if _ft_state_id else {})})
+                        if _ft_optimizer_store is not None:
+                            _ft_optimizer_store.mark_checkpoint(
+                                _pp, epoch + 1 + ft_epoch_offset, _ft_state_id)
                     logger.info("[h3-ft] paused. Continue with: --dit %s "
                                 "--finetune_start_window %d", os.path.basename(_pp), _next_w)
                     # The checkpoint now carries everything — the scratch is superseded.
@@ -5376,10 +5680,19 @@ def train_minimax(
     if rotator is not None:
         from fizgig.minimax.rotation_ft import save_full_checkpoint_h3
         _next_w = rot_schedule.window_at(max_train_epochs)
+        if _ft_prodigy and optimizer is not None:
+            _ft_stash_live()
+        _ft_state_id = (_ft_new_optimizer_state_id()
+                        if _ft_optimizer_store is not None else "")
         save_full_checkpoint_h3(rotator, dit_path, final, extra_metadata={
             **_meta(), "fizgig_next_start_window": str(_next_w),
             "fizgig_ft_n_windows": str(rot_schedule.n_windows),
-            "fizgig_ft_epochs_done": str(max_train_epochs + ft_epoch_offset)})
+            "fizgig_ft_epochs_done": str(max_train_epochs + ft_epoch_offset),
+            **({"fizgig_prodigy_state_id": _ft_state_id}
+               if _ft_state_id else {})})
+        if _ft_optimizer_store is not None:
+            _ft_optimizer_store.mark_checkpoint(
+                final, max_train_epochs + ft_epoch_offset, _ft_state_id)
         logger.info("[h3-ft] saved final fine-tuned checkpoint: %s — test it in ComfyUI as a "
                     "normal H3 model, or distil it to a LoRA with Checkpoint to LoRA. To train "
                     "it further: --dit %s --finetune_start_window %d",
@@ -5395,9 +5708,11 @@ def train_minimax(
         return final
     if ema is not None:
         ema.swap_in()
+    _optimizer_eval(optimizer)
     try:
         _save_lora(network, final, network_dim, network_alpha, dtype, _meta())
     finally:
+        _optimizer_train(optimizer)
         if ema is not None:
             ema.swap_out()
     logger.info(f"saved final LoRA: {final}")

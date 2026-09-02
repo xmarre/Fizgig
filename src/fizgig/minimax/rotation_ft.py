@@ -277,20 +277,26 @@ def ft_clip_activation_gb(latent_t, spatial_mp):
     return act, _FT_CLIP_FRAG_MARGIN_GB
 
 
-def plan_h3_ft_windows(usable_gb, subset=None, n_blocks=50, allow_stream=True):
+def plan_h3_ft_windows(usable_gb, subset=None, n_blocks=50, allow_stream=True,
+                       window_cost_scale=1.0, fixed_overhead_gb=0.0):
     """The H3 component-window plan for a VRAM budget: (windows, stream, reasons).
 
     A thin wrapper over the family-agnostic plan_component_windows with H3's calibrated
     constants — windows are bare prefixes where the full span fits, (prefix, lo, hi)
     depth-splits where it doesn't, and stream=True is the 16 GB tier (frozen
-    out-of-window blocks ring in from CPU). Returns (None, ..., reasons) when the budget
-    can't run FT at all. Pure so the tier table is pinnable without a card."""
+    out-of-window blocks ring in from CPU). window_cost_scale accounts for optimizer
+    implementations whose live gradients/state scale with the active bf16 window;
+    fixed_overhead_gb accounts for optimizer state on always-on modules. The defaults
+    preserve the measured fused-Adafactor planner exactly. Returns (None, ..., reasons)
+    when the budget can't run FT at all. Pure so the tier table is pinnable without a card."""
     from fizgig.krea2.rotation import plan_component_windows
     span = sorted(int(b) for b in subset) if subset else range(int(n_blocks))
     return plan_component_windows(
         usable_gb, span, n_blocks,
-        {p: H3_COMPONENT_GB_PER_BLOCK[p] for p in H3_COMPONENT_PREFIXES},
-        overhead_gb=_FT_OVERHEAD_GB, trunk_gb_per_block=_FT_NF4_GB_PER_BLOCK,
+        {p: H3_COMPONENT_GB_PER_BLOCK[p] * float(window_cost_scale)
+         for p in H3_COMPONENT_PREFIXES},
+        overhead_gb=_FT_OVERHEAD_GB + float(fixed_overhead_gb),
+        trunk_gb_per_block=_FT_NF4_GB_PER_BLOCK,
         slots_gb=_FT_STREAM_SLOTS_GB, allow_stream=allow_stream,
         max_sane_windows=_FT_MAX_SANE_WINDOWS)
 
